@@ -1,4 +1,4 @@
-# YukiOS: Multi-Environment Web Desktop for the Browser
+# YukiOS: Multi-Environment Web Desktop for the Browser (note not made by me plz star the original project at https://github.com/Reeyuki/YukiOS tyvm)
 
 <div align="center">
 
