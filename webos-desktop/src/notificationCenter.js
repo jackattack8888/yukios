@@ -1,0 +1,638 @@
+import { makeDraggable } from "./shared/dragUtils.js";
+import { isImageFile } from "./fileDisplay.js";
+import { appMap } from "./games/gamesList.js";
+import { audioMixer, SystemAudio } from "./audioMixer.js";
+import { $, createElement, setHTML, toggleClass, addClass, removeClass } from "./shared/domUtils.js";
+import { getSetting, parseBool, timeAgo, escapeHtml } from "./utils/utils.js";
+import { resolveIconUrl } from "./shared/assetResolver.js";
+import { createTrayPinButton, setTrayPinState } from "./shared/trayPin.js";
+import { APP_MANIFESTS, StorageKeys, os } from "./framework.js";
+
+const APP_SOURCE_TO_APP_MAP_KEY = APP_MANIFESTS.reduce(
+  (acc, manifest) => {
+    acc[manifest.title] = manifest.serviceKey;
+    return acc;
+  },
+  {
+    V86App: "v86app",
+    JsDosApp: "jsDosApp",
+    RuffleApp: "ruffleApp",
+    MonacoApp: "monaco"
+  }
+);
+
+export class NotificationCenter {
+  constructor() {
+    this.notifications = [];
+    this.snoozedNotifications = [];
+    this.isOpen = false;
+    this.pinned = false;
+    this.maxNotifications = 50;
+    this.notificationId = 0;
+    this.doNotDisturb = this.loadDoNotDisturb();
+    this.lastNotification = new Map();
+    this.suppressOutsideClick = false;
+    this.createNotificationCenterUI();
+    this.initTrayEntry();
+    this.updateDoNotDisturbUI();
+  }
+
+  getSetting(key, defaultValue) {
+    return getSetting(key, defaultValue);
+  }
+
+  applyNotificationPosition(container) {
+    const position = this.getSetting("notificationsPosition", "bottom-right");
+    container.className = "ntf-toast-container";
+
+    switch (position) {
+      case "bottom-left":
+        container.classList.add("ntf-toast-container--bottom-left");
+        break;
+      case "top-right":
+        container.classList.add("ntf-toast-container--top-right");
+        break;
+      case "top-left":
+        container.classList.add("ntf-toast-container--top-left");
+        break;
+      default:
+        container.classList.add("ntf-toast-container--bottom-right");
+    }
+  }
+
+  createNotificationCenterUI() {
+    const centerContainer = createElement("div", {
+      id: "ntf-panel",
+      className: "ntf-panel ntf-panel--closed"
+    });
+
+    setHTML(
+      centerContainer,
+      `
+      <div class="ntf-panel__head">
+        <span>Notifications</span>
+        <button class="ntf-panel__dnd" title="Do Not Disturb">DND</button>
+        <button class="ntf-panel__dismiss" title="Close">×</button>
+      </div>
+      <div class="ntf-panel__feed"></div>
+      <div class="ntf-panel__foot">
+        <button class="ntf-purge-btn">Clear All</button>
+      </div>
+    `
+    );
+
+    document.body.appendChild(centerContainer);
+
+    $(".ntf-panel__dismiss", centerContainer).addEventListener("click", () => {
+      this.closeCenter();
+    });
+
+    const dismissBtn = $(".ntf-panel__dismiss", centerContainer);
+    const pinBtn = createTrayPinButton();
+    dismissBtn.parentNode.insertBefore(pinBtn, dismissBtn);
+    setTrayPinState(centerContainer, pinBtn, this.pinned);
+    pinBtn.addEventListener("click", () => {
+      this.togglePin();
+    });
+
+    $(".ntf-panel__dnd", centerContainer).addEventListener("click", () => {
+      this.setDoNotDisturb(!this.doNotDisturb);
+    });
+
+    $(".ntf-purge-btn", centerContainer).addEventListener("click", () => {
+      this.clearAllNotifications();
+    });
+  }
+
+  initTrayEntry() {
+    this.notificationWinId = "notification";
+    this.updateTrayPresence();
+  }
+
+  updateTrayPresence() {
+    const totalCount = this.notifications.length + this.snoozedNotifications.length;
+    const hasItems = totalCount > 0;
+
+    if (hasItems) {
+      if (!os.tray.isRegistered(this.notificationWinId)) {
+        os.tray.register(
+          this.notificationWinId,
+          "papirus:apps/preferences-desktop-notification-bell",
+          "Notifications",
+          {
+            showInTray: true,
+            alwaysVisible: true,
+            onClick: () => this.toggleCenter()
+          }
+        );
+        this.updateTrayIcon();
+      }
+    } else {
+      if (os.tray.isRegistered(this.notificationWinId)) {
+        os.tray.unregister(this.notificationWinId);
+      }
+    }
+
+    requestAnimationFrame(() => {
+      if (this.isOpen) {
+        const btn = $(`[data-win-id="${this.notificationWinId}"]`);
+        if (btn) btn.classList.add("active");
+      }
+    });
+  }
+
+  updateTrayIcon() {
+    if (os.tray.isRegistered(this.notificationWinId)) {
+      const icon = this.doNotDisturb
+        ? "papirus:status/audio-volume-muted"
+        : "papirus:apps/preferences-desktop-notification-bell";
+      os.tray.updateIcon(this.notificationWinId, icon);
+    }
+  }
+
+  updateTrayActiveState() {
+    const btn = $(`[data-win-id="${this.notificationWinId}"]`);
+    if (btn) {
+      btn.classList.toggle("active", this.isOpen);
+    }
+  }
+
+  addNotification(title, message, type = "info", duration = 5000, icon = null, appSource = null) {
+    const enabled = this.getSetting("notificationsEnabled", true);
+    if (!enabled) return null;
+    const key = `${title}::${message}`;
+    const now = Date.now();
+    const last = this.lastNotification.get(key);
+    if (last && now - last < 1000) return null;
+    this.lastNotification.set(key, now);
+
+    if (!icon && appSource) {
+      const appMapKey = APP_SOURCE_TO_APP_MAP_KEY[appSource];
+      if (appMapKey && appMap[appMapKey]) {
+        icon = appMap[appMapKey].icon;
+      } else {
+        for (const [key, app] of Object.entries(appMap)) {
+          if (app.title === appSource) {
+            icon = app.icon;
+            break;
+          }
+        }
+      }
+    }
+
+    const notification = {
+      id: this.notificationId++,
+      title,
+      message,
+      type,
+      timestamp: new Date(),
+      icon,
+      appSource
+    };
+
+    if (this.doNotDisturb) {
+      this.snoozedNotifications.unshift(notification);
+      this.enforceMaxNotifications();
+      this.updateNotificationCenter();
+      this.updateTrayPresence();
+      this.persistNotifications();
+      return notification.id;
+    }
+
+    this.notifications.unshift(notification);
+    this.enforceMaxNotifications();
+    this.updateNotificationCenter();
+    this.updateTrayPresence();
+    this.persistNotifications();
+    this.showToast(notification);
+
+    return notification.id;
+  }
+
+  showToast(notif) {
+    if (this.doNotDisturb) return;
+
+    if (notif.type === "warning") {
+      audioMixer().playSystemSound(SystemAudio.WARNING);
+    }
+
+    let container = $("#ntf-toast-container");
+    if (!container) {
+      container = createElement("div", {
+        id: "ntf-toast-container",
+        className: "ntf-toast-container"
+      });
+      this.applyNotificationPosition(container);
+      document.body.appendChild(container);
+    } else {
+      this.applyNotificationPosition(container);
+    }
+
+    while (container.children.length >= 4) {
+      const oldest = container.firstChild;
+      if (oldest) {
+        oldest.remove();
+      }
+    }
+
+    const typeMap = {
+      info: "ntf-toast--info",
+      success: "ntf-toast--ok",
+      warning: "ntf-toast--warn",
+      error: "ntf-toast--fail"
+    };
+    const showAnim = this.getSetting("notificationsPopAnimation", true);
+    const toast = createElement("div", {
+      className: `ntf-toast ${typeMap[notif.type] || "ntf-toast--info"}${showAnim ? "" : " ntf-toast--no-animation"}`
+    });
+
+    const iconHtml = this.buildNotificationIconHtml(notif, "ntf-toast__glyph ntf-toast__glyph-img", "ntf-toast__glyph");
+
+    setHTML(
+      toast,
+      `
+      <div class="ntf-toast__glyph-wrap">${iconHtml}</div>
+      <div class="ntf-toast__body">
+        ${notif.appSource ? `<div class="ntf-toast__source">${escapeHtml(notif.appSource)}</div>` : ""}
+        <div class="ntf-toast__heading">${escapeHtml(notif.title)}</div>
+        <div class="ntf-toast__text">${escapeHtml(notif.message ?? "")}</div>
+      </div>
+      <button class="ntf-toast__close" title="Dismiss">×</button>
+      <div class="ntf-toast__progress"></div>
+    `
+    );
+
+    container.appendChild(toast);
+
+    let removed = false;
+    let dismissTimer = null;
+    let dragHistory = [];
+    let dragCleanup = null;
+    let startPointerX = 0;
+
+    const threshold = toast.offsetWidth * 0.3;
+
+    const removeToast = () => {
+      if (removed) return;
+      removed = true;
+      if (dragCleanup) dragCleanup();
+      toast.classList.add("ntf-toast-out");
+      setTimeout(() => toast.remove(), 300);
+    };
+
+    $(".ntf-toast__close", toast).addEventListener("click", removeToast);
+
+    const removeTimeout = this.getSetting("notificationsRemoveTimeout", true);
+    if (removeTimeout) {
+      const durationSec = this.getSetting("notificationsDuration", 5);
+      const progressBar = toast.querySelector(".ntf-toast__progress");
+      if (progressBar) {
+        progressBar.style.animation = `toastProgress ${durationSec}s linear forwards`;
+      }
+      dismissTimer = setTimeout(removeToast, durationSec * 1000);
+    }
+
+    const self = this;
+    dragCleanup = makeDraggable(
+      toast,
+      {
+        start() {
+          dragHistory = [];
+          startPointerX = 0;
+          toast.classList.add("ntf-toast--dragging");
+          if (dismissTimer) {
+            clearTimeout(dismissTimer);
+            dismissTimer = null;
+          }
+        },
+        move(e, dx, dy, clientX, clientY, pageX, pageY, totalDx) {
+          toast.style.transform = `translateX(${totalDx}px)`;
+          toast.style.opacity = Math.abs(totalDx) > threshold ? "0.5" : "1";
+          dragHistory.push({ x: clientX, t: performance.now() });
+          if (dragHistory.length > 5) dragHistory.shift();
+        },
+        end(e, totalDx) {
+          let velocity = 0;
+          if (dragHistory.length >= 2) {
+            const first = dragHistory[0];
+            const last = dragHistory[dragHistory.length - 1];
+            const dt = last.t - first.t;
+            if (dt > 0) {
+              velocity = (last.x - first.x) / dt;
+            }
+          }
+          dragHistory = [];
+
+          if (Math.abs(totalDx) > threshold || Math.abs(velocity) > 0.3) {
+            self.removeNotification(notif.id);
+            const flyDir = Math.abs(totalDx) > threshold ? Math.sign(totalDx) : Math.sign(velocity);
+            const extra = Math.max(Math.abs(velocity) * 500, 0);
+            toast.style.transition = "transform 0.4s cubic-bezier(0.15, 0.7, 0.3, 1), opacity 0.4s ease";
+            toast.style.transform = `translateX(${flyDir * (Math.abs(totalDx) + extra + window.innerWidth)}px)`;
+            toast.style.opacity = "0";
+            setTimeout(() => {
+              removed = true;
+              if (dragCleanup) dragCleanup();
+              toast.remove();
+            }, 450);
+          } else {
+            toast.classList.remove("ntf-toast--dragging");
+            toast.style.transition = "none";
+            toast.style.transform = "translateX(0px)";
+            toast.style.opacity = "1";
+          }
+        }
+      },
+      { axis: "x", ignoreFrom: ".ntf-toast__close" }
+    );
+  }
+
+  buildNotificationIconHtml(notif, imgClass, iconClass) {
+    if (notif.icon) {
+      if (typeof notif.icon === "string" && notif.icon.startsWith("papirus:")) {
+        const url = resolveIconUrl(notif.icon);
+        return `<img src="${escapeHtml(url)}" class="${imgClass}" alt="" />`;
+      }
+      const isImagePath = isImageFile(notif.icon);
+      const isDataUrl = typeof notif.icon === "string" && notif.icon.startsWith("data:");
+
+      if (isImagePath || isDataUrl) {
+        return `<img src="${escapeHtml(notif.icon)}" class="${imgClass}" />`;
+      } else if (typeof notif.icon === "string" && notif.icon.trim().length > 0) {
+        if (notif.icon.startsWith("papirus:")) {
+          const url = resolveIconUrl(notif.icon);
+          return `<img src="${escapeHtml(url)}" class="${imgClass}" alt="" />`;
+        }
+        let cls = notif.icon;
+        if (cls.startsWith("fa-") && !cls.startsWith("fas ") && !cls.startsWith("far ") && !cls.startsWith("fab ")) {
+          cls = `fas ${cls}`;
+        } else if (!cls.startsWith("fa")) {
+          cls = `fa ${cls}`;
+        }
+        return `<i class="${escapeHtml(cls)} ${iconClass}"></i>`;
+      }
+    } else {
+      const iconMap = {
+        info: "papirus:actions/help-about",
+        success: "papirus:actions/object-select",
+        warning: "papirus:actions/dialog-warning",
+        error: "papirus:actions/dialog-error"
+      };
+      const papirusIcon = iconMap[notif.type] ?? "papirus:actions/help-about";
+      const url = resolveIconUrl(papirusIcon);
+      return `<img src="${escapeHtml(url)}" class="${imgClass}" alt="" />`;
+    }
+    return "";
+  }
+
+  removeNotification(id) {
+    this.notifications = this.notifications.filter((n) => n.id !== id);
+    this.snoozedNotifications = this.snoozedNotifications.filter((n) => n.id !== id);
+    this.updateNotificationCenter();
+    this.updateTrayPresence();
+    this.persistNotifications();
+  }
+
+  clearAllNotifications() {
+    this.notifications = [];
+    this.snoozedNotifications = [];
+    this.updateNotificationCenter();
+    this.updateTrayPresence();
+    this.persistNotifications();
+  }
+
+  updateNotificationCenter() {
+    const list = $(".ntf-panel__feed");
+    if (!list) return;
+
+    setHTML(list, "");
+
+    const visibleNotifications = this.doNotDisturb
+      ? [...this.snoozedNotifications, ...this.notifications]
+      : this.notifications;
+
+    if (visibleNotifications.length === 0) {
+      const empty = createElement("div", {
+        className: "ntf-panel__blank",
+        text: "No notifications"
+      });
+      list.appendChild(empty);
+      return;
+    }
+
+    visibleNotifications.forEach((notif) => {
+      const typeMap = {
+        info: "ntf-card--info",
+        success: "ntf-card--ok",
+        warning: "ntf-card--warn",
+        error: "ntf-card--fail"
+      };
+      const item = createElement("div", {
+        className: `ntf-card ${typeMap[notif.type] || "ntf-card--info"}`
+      });
+      item.dataset.id = notif.id;
+
+      const timestamp = this.formatTime(notif.timestamp);
+
+      const iconHtml = this.buildNotificationIconHtml(notif, "ntf-card__glyph", "ntf-card__glyph");
+
+      setHTML(
+        item,
+        `
+        <div class="ntf-card__glyph-wrap">
+          ${iconHtml}
+        </div>
+        <div class="ntf-card__body">
+          ${notif.appSource ? `<div class="ntf-card__source">${escapeHtml(notif.appSource)}</div>` : ""}
+          <div class="ntf-card__heading">${escapeHtml(notif.title)}</div>
+          <div class="ntf-card__text">${escapeHtml(notif.message ?? "")}</div>
+          <div class="ntf-card__stamp">${timestamp}</div>
+        </div>
+        <button class="ntf-card__remove" title="Remove">×</button>
+      `
+      );
+
+      $(".ntf-card__remove", item).addEventListener("click", () => {
+        this.removeNotification(notif.id);
+      });
+
+      list.appendChild(item);
+    });
+  }
+
+  handleOutsideClick = (e) => {
+    if (this.pinned) return;
+    if (this.suppressOutsideClick) {
+      this.suppressOutsideClick = false;
+      return;
+    }
+    const panel = $("#ntf-panel");
+    const trayEl = $("#app-tray");
+    if (panel && !e.target.closest("#ntf-panel") && !e.target.closest("#app-tray")) {
+      this.closeCenter();
+    }
+  };
+
+  togglePin() {
+    this.pinned = !this.pinned;
+    const panel = $("#ntf-panel");
+    const btn = panel ? $(".tray-pin-btn", panel) : null;
+    setTrayPinState(panel, btn, this.pinned);
+  }
+
+  toggleCenter() {
+    if (this.isOpen) {
+      this.closeCenter();
+    } else {
+      this.openCenter();
+    }
+  }
+
+  openCenter() {
+    const center = $("#ntf-panel");
+    if (!center) return;
+
+    removeClass(center, "ntf-panel--closed");
+    center.offsetHeight;
+    addClass(center, "open");
+    this.isOpen = true;
+    this.suppressOutsideClick = true;
+
+    this.updateTrayActiveState();
+    document.addEventListener("click", this.handleOutsideClick);
+  }
+
+  closeCenter() {
+    const center = $("#ntf-panel");
+    if (!center) return;
+
+    removeClass(center, "open");
+    setTimeout(() => {
+      if (!this.isOpen) {
+        addClass(center, "ntf-panel--closed");
+      }
+    }, 300);
+    this.isOpen = false;
+
+    this.updateTrayActiveState();
+    document.removeEventListener("click", this.handleOutsideClick);
+  }
+
+  setDoNotDisturb(enabled) {
+    this.doNotDisturb = Boolean(enabled);
+    try {
+      os.storage.set(StorageKeys.dndKey, this.doNotDisturb ? "1" : "0");
+    } catch {}
+
+    if (!this.doNotDisturb && this.snoozedNotifications.length > 0) {
+      for (let i = this.snoozedNotifications.length - 1; i >= 0; i--) {
+        this.notifications.unshift(this.snoozedNotifications[i]);
+      }
+      this.snoozedNotifications = [];
+      this.enforceMaxNotifications();
+    }
+
+    this.updateDoNotDisturbUI();
+    this.updateNotificationCenter();
+    this.updateTrayPresence();
+    this.persistNotifications();
+  }
+
+  persistNotifications() {
+    try {
+      os.storage.set(StorageKeys.notificationHistory, {
+        notifications: this.notifications,
+        snoozedNotifications: this.snoozedNotifications,
+        nextId: this.notificationId
+      });
+    } catch {}
+  }
+
+  loadPersistedNotifications() {
+    try {
+      const data = os.storage.get(StorageKeys.notificationHistory);
+      if (!data) return;
+      let rawNotifications = [];
+      let rawSnoozed = [];
+      let rawNextId = null;
+      if (Array.isArray(data)) {
+        rawNotifications = data;
+      } else if (data.notifications) {
+        rawNotifications = Array.isArray(data.notifications) ? data.notifications : [];
+        rawSnoozed = Array.isArray(data.snoozedNotifications) ? data.snoozedNotifications : [];
+        rawNextId = data.nextId;
+      } else {
+        return;
+      }
+      const normalize = (list) =>
+        list
+          .filter((n) => n && typeof n.title === "string" && typeof n.message !== "undefined")
+          .map((n) => ({
+            id: typeof n.id === "number" ? n.id : 0,
+            title: n.title,
+            message: n.message,
+            type: n.type || "info",
+            timestamp: n.timestamp ? new Date(n.timestamp) : new Date(),
+            icon: n.icon ?? null,
+            appSource: n.appSource ?? null
+          }))
+          .filter((n) => !isNaN(n.timestamp.getTime()));
+      this.notifications = normalize(rawNotifications);
+      this.snoozedNotifications = normalize(rawSnoozed);
+      const maxId = [...this.notifications, ...this.snoozedNotifications].reduce((m, n) => Math.max(m, n.id), -1);
+      if (typeof rawNextId === "number" && rawNextId > maxId) {
+        this.notificationId = rawNextId;
+      } else {
+        this.notificationId = maxId + 1;
+      }
+      this.enforceMaxNotifications();
+    } catch {}
+  }
+
+  restorePersistedState() {
+    try {
+      this.doNotDisturb = this.loadDoNotDisturb();
+    } catch {}
+    this.loadPersistedNotifications();
+    this.updateDoNotDisturbUI();
+    this.updateNotificationCenter();
+    this.updateTrayPresence();
+  }
+
+  loadDoNotDisturb() {
+    try {
+      return parseBool(os.storage.get(StorageKeys.dndKey));
+    } catch {
+      return false;
+    }
+  }
+
+  enforceMaxNotifications() {
+    while (this.notifications.length + this.snoozedNotifications.length > this.maxNotifications) {
+      if (this.notifications.length > 0) {
+        this.notifications.pop();
+      } else {
+        this.snoozedNotifications.pop();
+      }
+    }
+  }
+
+  updateDoNotDisturbUI() {
+    const dndBtn = $(".ntf-panel__dnd");
+    if (dndBtn) toggleClass(dndBtn, "active", this.doNotDisturb);
+
+    this.updateTrayIcon();
+  }
+
+  formatTime(date) {
+    return timeAgo(date);
+  }
+
+  getNotifications() {
+    return [...this.notifications, ...this.snoozedNotifications];
+  }
+
+  getNotificationCount() {
+    return this.notifications.length + this.snoozedNotifications.length;
+  }
+}

@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Scramjet App</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      html,
+      body,
+      #app {
+        width: 100vw;
+        height: 100vh;
+        overflow: hidden;
+        background: #000;
+      }
+      iframe {
+        width: 100%;
+        height: 100%;
+        border: none;
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script src="/s/set.js"></script>
+    <script src="/s/controller.api.js"></script>
+    <script type="module">
+      import { default as EpoxyTransport } from "https://cdn.jsdelivr.net/npm/@mercuryworkshop/epoxy-transport@3.0.1/dist/index.mjs";
+
+      const urlParams = new URLSearchParams(window.location.search);
+      const DEFAULT_WISP_URL = "wss://hurt-agata-liventcord-api-7072e9a6.koyeb.app/";
+      const WISP_URL = urlParams.get("wisp") || DEFAULT_WISP_URL;
+      const TARGET_URL = urlParams.get("target") || "https://example.com";
+
+      let basePath = location.pathname.replace(/[^/]*$/, "");
+      if (!basePath.endsWith("/")) basePath += "/";
+
+      const reg = await navigator.serviceWorker.register(basePath + "sw.js", { scope: basePath });
+      await navigator.serviceWorker.ready;
+      const sw = reg.active || navigator.serviceWorker.controller;
+
+      const rawTransport = new EpoxyTransport({ wisp: WISP_URL });
+
+      const transport = {
+        get ready() {
+          return rawTransport.ready;
+        },
+        async init() {
+          return rawTransport.init();
+        },
+        async request(remote, method, body, headers, signal) {
+          const headersArr = Array.isArray(headers)
+            ? headers
+            : headers && typeof headers === "object"
+              ? Object.entries(headers)
+              : [];
+          const res = await rawTransport.request(remote, method, body, headersArr, signal);
+          const headersEntries = Array.isArray(res.headers)
+            ? res.headers
+            : res.headers && typeof res.headers === "object"
+              ? Object.entries(res.headers)
+              : [];
+          return { ...res, headers: headersEntries };
+        },
+        connect(url, protocols, requestHeaders, onopen, onmessage, onclose, onerror) {
+          const headersArr = Array.isArray(requestHeaders)
+            ? requestHeaders
+            : requestHeaders && typeof requestHeaders === "object"
+              ? Object.entries(requestHeaders)
+              : [];
+          return rawTransport.connect(url, protocols, headersArr, onopen, onmessage, onclose, onerror);
+        }
+      };
+
+      const { Controller } = $scramjetController;
+      const scramjet = new Controller({
+        config: {
+          prefix: basePath + "scramjet/",
+          wasmPath: "/s/set.wasm",
+          scramjetPath: "/s/set.js",
+          injectPath: "/s/controller.inject.js"
+        },
+        transport,
+        serviceworker: sw
+      });
+
+      await scramjet.wait();
+
+      const frame = scramjet.createFrame();
+      document.getElementById("app").appendChild(frame.element);
+      frame.go(TARGET_URL);
+      const POPUP_ID = urlParams.get("popupId") || "";
+      const PARENT_NAME = urlParams.get("parentName") || "App";
+      window.yukiScramjetFrame = frame;
+      const POPUP_FLAG = "scramjet_windowopen_newtab";
+      function popupEnabled() { try { const v = localStorage.getItem(POPUP_FLAG); return v === null ? true : v !== "false"; } catch { return true; } }
+      function sendPopupOpen(url, target, pageTitle) { try { window.parent.postMessage({ type: "scramjet:popup-open", url: String(url), target: target || "", pageTitle: pageTitle || "" }, "*"); } catch {} }
+      function toPlainPopupUrl(raw, baseHint) { if (raw == null) return null; var text = String(raw).trim(); if (!text) return null; if (/^javascript:/i.test(text) || /^mailto:/i.test(text)) return null; if (/^(about|data|blob):/i.test(text)) return text; var marker = "/s/scramjet/"; if (text.indexOf(marker) !== -1) { text = text.substring(text.lastIndexOf(marker) + marker.length); var parts = text.split("/"); var dropCount = 0; while (dropCount < 2 && parts.length > 1 && parts[0] && parts[0].indexOf(".") === -1 && parts[0].indexOf(":") === -1 && parts[0].indexOf("%") === -1) { parts.shift(); dropCount++; } text = parts.join("/"); } for (var di = 0; di < 3; di++) { var low = text.toLowerCase(); var hasMarker = text.indexOf(marker) !== -1; var hasEnc = low.indexOf("%2f") !== -1 || low.indexOf("%3a") !== -1; if (!hasMarker && !hasEnc) break; if (hasMarker) { text = text.substring(text.lastIndexOf(marker) + marker.length); var innerParts = text.split("/"); var innerDrop = 0; while (innerDrop < 2 && innerParts.length > 1 && innerParts[0] && innerParts[0].indexOf(".") === -1 && innerParts[0].indexOf(":") === -1 && innerParts[0].indexOf("%") === -1) { innerParts.shift(); innerDrop++; } text = innerParts.join("/"); } try { var dec = decodeURIComponent(text); if (dec === text) { if (!hasMarker) break; } else { text = dec; } } catch (decodeErr) { break; } } if (text.indexOf(marker) !== -1) { text = text.substring(text.lastIndexOf(marker) + marker.length); } var innerHref = ""; try { innerHref = frame?.element?.contentWindow?.location?.href || ""; } catch (innerHrefErr) { innerHref = ""; } try { return new URL(text, baseHint || innerHref || location.href).href; } catch (plainUrlErr) { return text; } }
+      if (POPUP_ID) {
+        let lastPopupTitle = "";
+        setInterval(() => { try { const cw = frame?.element?.contentWindow; const t = cw?.document?.title || ""; if (t && t !== lastPopupTitle) { lastPopupTitle = t; window.parent.postMessage({ type: "scramjet:popup-title", popupId: POPUP_ID, title: t, parentName: PARENT_NAME }, "*"); } } catch {} }, 1500);
+      } else {
+        function patchInner(innerWin) { try { if (!innerWin || innerWin.yukiPopupPatched) return; const orig = innerWin.open; if (!orig) return; const handler = function(url, target) { let enabled = popupEnabled(); if (!enabled) return orig.apply(this, arguments); const t = String(target || ""); if (t === "_self" || t === "_parent" || t === "_top") { if (url) { try { innerWin.location.href = String(url); } catch {} } return innerWin; } let raw = url == null ? "" : String(url).trim(); if (!raw || /^javascript:/i.test(raw) || /^mailto:/i.test(raw)) return null; var baseForResolve = ""; try { baseForResolve = innerWin.location.href; } catch (resolveBaseErr) {} raw = toPlainPopupUrl(raw, baseForResolve) || raw; if (!raw || /^javascript:/i.test(raw)) return null; let pageTitle = ""; try { pageTitle = innerWin.document?.title || ""; } catch {} sendPopupOpen(raw, t, pageTitle); const fake = { closed: false, focus() {}, close() {}, location: { href: raw } }; return fake; }; handler.yukiPopupPatched = true; try { innerWin.open = handler; } catch {} try { if (innerWin.Window?.prototype) innerWin.Window.prototype.open = handler; } catch {} innerWin.yukiPopupPatched = true; } catch {} }
+        function bindInnerClicks() { try { const cw = frame?.element?.contentWindow; const doc = cw?.document; if (!doc || doc.yukiClickBound) return; doc.yukiClickBound = true; doc.addEventListener("click", (e) => { try { if (!popupEnabled()) return; const a = e.target?.closest?.("a"); if (!a) return; if ((a.target || "").toLowerCase() !== "_blank") return; const href = a.href || a.getAttribute("href") || ""; if (!href || /^javascript:/i.test(href) || /^mailto:/i.test(href)) return; var base = ""; try { base = doc.baseURI || cw.location.href || location.href; } catch (clickBaseErr) {} var resolved = toPlainPopupUrl(href, base) || href; if (!resolved) return; e.preventDefault(); e.stopPropagation(); sendPopupOpen(resolved, "_blank", doc.title || ""); } catch {} }, true); doc.addEventListener("submit", (e) => { try { if (!popupEnabled()) return; const f = e.target; if (!f || (f.target || "").toLowerCase() !== "_blank") return; const action = f.action || ""; if (!action) return; var base = ""; try { base = doc.baseURI || cw.location.href || location.href; } catch (submitBaseErr) {} var resolved = toPlainPopupUrl(action || ".", base) || base; e.preventDefault(); sendPopupOpen(resolved, "_blank", doc.title || ""); } catch {} }, true); } catch {} }
+        function tryPatchAll() { try { const cw = frame?.element?.contentWindow; if (cw) { patchInner(cw); bindInnerClicks(); try { for (let i = 0; i < cw.frames.length; i++) { try { patchInner(cw.frames[i]); } catch {} } } catch {} } } catch {} }
+        setInterval(tryPatchAll, 1000);
+        setTimeout(tryPatchAll, 500);
+        setTimeout(tryPatchAll, 2500);
+        try { frame.element.addEventListener("load", tryPatchAll); } catch {}
+      }
+    </script>
+  </body>
+</html>

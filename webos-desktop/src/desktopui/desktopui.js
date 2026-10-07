@@ -1,0 +1,1526 @@
+import { updateFavoritesUI, setupStartMenu as setupStartMenuFn, isStartMenuBlocked } from "./startMenu.js";
+import { isIntroTourKeepingStartMenuOpen } from "../apps/introTour.js";
+import { desktop } from "./desktop.js";
+import { makeDraggable } from "../shared/dragUtils.js";
+import { StorageKeys, os, $, $$, createElement, setStyle } from "../framework.js";
+import { hideMenu } from "../shared/contextMenu.js";
+import { isWindowFocused, rectsIntersect } from "../utils/utils.js";
+import { DesktopContextMenuManager } from "./ContextMenuManager.js";
+import { IconManager } from "./iconManager.js";
+import { DragDropManager } from "./dragDropManager.js";
+import { ClipboardManager } from "./fileClipboardManager.js";
+import { showFileProperties } from "../fileDisplay.js";
+import { resolveIconUrl } from "../shared/assetResolver.js";
+import { resolveFilePayload } from "../apps/explorer/upload.js";
+import { showConflictDialog } from "../shared/conflictDialog.js";
+import { FileKind } from "../shared/fileKindDetector.js";
+import { KeybindManager } from "../keybindManager.js";
+import { WidgetManager } from "./widgetManager.js";
+import { ClockWidget } from "./widgets/clockWidget.js";
+import { NotesWidget } from "./widgets/notesWidget.js";
+import { WeatherWidget } from "./widgets/weatherWidget.js";
+import { CalendarWidget } from "./widgets/calendarWidget.js";
+import { SystemMonitorWidget } from "./widgets/systemMonitorWidget.js";
+import { MusicControlWidget } from "./widgets/musicControlWidget.js";
+import { TodoWidget } from "./widgets/todoWidget.js";
+import { PowerWidget } from "./widgets/powerWidget.js";
+import { ClipboardWidget } from "./widgets/clipboardWidget.js";
+import { PhotoFrameWidget } from "./widgets/photoFrameWidget.js";
+import { TimerWidget } from "./widgets/timerWidget.js";
+import { YouTubeWidget } from "./widgets/youtubeWidget.js";
+import { AquariumWidget } from "./widgets/aquariumWidget.js";
+import { RhythmsWidget } from "./widgets/rhythmsWidget.js";
+import { applyStartButtonIcon, showStartButtonContextMenu } from "./startButtonManager.js";
+import { applyAppCustomizations } from "../shared/appCustomizer.js";
+import "../styles/startButtonPicker.css";
+
+let GRID_CONFIG = { width: 84, height: 80, gap: 1, marginX: 24, marginY: 24 };
+
+export function updateGridConfig(iconSize) {
+  const parsed = Number(iconSize);
+  const size = Math.max(32, Math.min(128, Number.isFinite(parsed) ? parsed : 48));
+  GRID_CONFIG.width = size + 36;
+  GRID_CONFIG.height = size + 32;
+  GRID_CONFIG.gap = 1;
+  relayoutDesktopIcons();
+}
+
+export function changeDesktopIconSize(size) {
+  os.storage.set(StorageKeys.desktopIconSize, String(size));
+  const parsedSize = Number(size);
+  const iconSize = Math.max(32, Math.min(128, Number.isFinite(parsedSize) ? parsedSize : 48));
+  document.documentElement.style.setProperty("--icon-w", `${iconSize + 32}px`);
+  document.documentElement.style.setProperty("--icon-img-s", `${iconSize}px`);
+  document.documentElement.style.setProperty("--icon-h", `${iconSize + 32}px`);
+  updateGridConfig(size);
+}
+
+export function relayoutDesktopIcons() {
+  const allIcons = Array.from(desktop.querySelectorAll(":scope > .icon")).filter(
+    (icon) => icon.style.display !== "none"
+  );
+  if (!allIcons.length) return;
+  if (desktop.clientWidth === 0 || desktop.clientHeight === 0) return;
+  const positionHelper = new PositionHelper(desktop, GRID_CONFIG);
+  const saved = PositionStore.load();
+  const { width, height, gap, marginX, marginY } = GRID_CONFIG;
+  const cellW = width + gap;
+  const cellH = height + gap;
+  const maxRows = Math.max(1, Math.floor((desktop.clientHeight - 2 * marginY) / cellH));
+  const maxCols = Math.max(1, Math.floor((desktop.clientWidth - 2 * marginX) / cellW));
+  const storedAlignment = os.storage.get(StorageKeys.desktopIconAlignment);
+  const alignment =
+    storedAlignment !== undefined && storedAlignment !== null && storedAlignment !== ""
+      ? storedAlignment
+      : "horizontal";
+  const autoSort = os.storage.get(StorageKeys.desktopAutoSort);
+  const shouldPreserve = !(autoSort === true || autoSort === "true");
+  if (!shouldPreserve) {
+    allIcons.forEach((i) => {
+      i.style.left = "";
+      i.style.top = "";
+    });
+    let occupied = new Set();
+    if (allIcons.length) {
+      occupied =
+        alignment === "vertical"
+          ? positionHelper.layoutSyncVertical(allIcons, false, occupied)
+          : positionHelper.layoutSync(allIcons, false, occupied);
+    }
+    const out = {};
+    allIcons.forEach((icon) => {
+      const leftRaw = parseFloat(icon.style.left);
+      const topRaw = parseFloat(icon.style.top);
+      const left = Number.isFinite(leftRaw) ? leftRaw : 0;
+      const top = Number.isFinite(topRaw) ? topRaw : 0;
+      const { col, row } = positionHelper.pixelsToCell(left, top);
+      out[PositionStore.getKey(icon)] = { col, row };
+    });
+    PositionStore.save(out);
+    return;
+  }
+  const occupied = new Set();
+  const toReflow = [];
+  for (const icon of allIcons) {
+    const key = PositionStore.getKey(icon);
+    const pos = saved[key];
+    if (
+      pos &&
+      Number.isFinite(pos.col) &&
+      Number.isFinite(pos.row) &&
+      pos.col >= 0 &&
+      pos.col < maxCols &&
+      pos.row >= 0 &&
+      pos.row < maxRows &&
+      !occupied.has(`${pos.col},${pos.row}`)
+    ) {
+      const { left, top } = positionHelper.cellToPixels(pos.col, pos.row);
+      positionHelper.setPosition(icon, left, top);
+      occupied.add(`${pos.col},${pos.row}`);
+    } else {
+      toReflow.push(icon);
+    }
+  }
+  for (const icon of toReflow) {
+    const key = PositionStore.getKey(icon);
+    const pos = saved[key];
+    let startCol = 0;
+    let startRow = 0;
+    if (pos && Number.isFinite(pos.col) && Number.isFinite(pos.row)) {
+      startCol = Math.max(0, Math.min(maxCols - 1, pos.col));
+      startRow = Math.max(0, Math.min(maxRows - 1, pos.row));
+    } else {
+      const leftRaw = parseFloat(icon.style.left);
+      const topRaw = parseFloat(icon.style.top);
+      if (Number.isFinite(leftRaw) && Number.isFinite(topRaw) && icon.style.left !== "") {
+        const cell = positionHelper.pixelsToCell(leftRaw, topRaw);
+        startCol = cell.col;
+        startRow = cell.row;
+      }
+    }
+    const free = positionHelper.nextFreeCell(startCol, startRow, icon, occupied);
+    const { left, top } = positionHelper.cellToPixels(free.col, free.row);
+    positionHelper.setPosition(icon, left, top);
+    occupied.add(`${free.col},${free.row}`);
+  }
+  const out = {};
+  allIcons.forEach((icon) => {
+    const leftRaw = parseFloat(icon.style.left);
+    const topRaw = parseFloat(icon.style.top);
+    const left = Number.isFinite(leftRaw) ? leftRaw : 0;
+    const top = Number.isFinite(topRaw) ? topRaw : 0;
+    const { col, row } = positionHelper.pixelsToCell(left, top);
+    out[PositionStore.getKey(icon)] = { col, row };
+  });
+  PositionStore.save(out);
+}
+
+class PositionHelper {
+  constructor(desktop, gridSize) {
+    this.desktop = desktop;
+    this.gridSize = gridSize;
+  }
+
+  cellToPixels(col, row) {
+    const { width, height, gap, marginX, marginY } = this.gridSize;
+    return { left: marginX + col * (width + gap), top: marginY + row * (height + gap) };
+  }
+
+  pixelsToCell(leftPx, topPx) {
+    const { width, height, gap, marginX, marginY } = this.gridSize;
+    const cellW = width + gap,
+      cellH = height + gap;
+    const maxRows = Math.max(1, Math.floor((this.desktop.clientHeight - 2 * marginY) / cellH));
+    const maxCols = Math.max(1, Math.floor((this.desktop.clientWidth - 2 * marginX) / cellW));
+    const col = Math.round((leftPx - marginX) / cellW);
+    const row = Math.round((topPx - marginY) / cellH);
+    return {
+      col: Math.max(0, Math.min(maxCols - 1, col)),
+      row: Math.max(0, Math.min(maxRows - 1, row))
+    };
+  }
+
+  buildOccupancySet(exclude = null) {
+    const set = new Set();
+    for (const icon of desktop.querySelectorAll(".icon.selectable")) {
+      if (icon === exclude || icon.style.display === "none") continue;
+      const { col, row } = this.pixelsToCell(parseFloat(icon.style.left) || 0, parseFloat(icon.style.top) || 0);
+      set.add(`${col},${row}`);
+    }
+    return set;
+  }
+
+  isCellOccupied(col, row, exclude = null) {
+    return this.buildOccupancySet(exclude).has(`${col},${row}`);
+  }
+
+  nextFreeCell(col, row, exclude = null, occupied = null) {
+    const { width, height, gap, marginX, marginY } = this.gridSize;
+    const cellW = width + gap,
+      cellH = height + gap;
+    const maxRows = Math.max(1, Math.floor((this.desktop.clientHeight - 2 * marginY) / cellH));
+    const maxCols = Math.max(1, Math.floor((this.desktop.clientWidth - 2 * marginX) / cellW));
+    if (!occupied) occupied = this.buildOccupancySet(exclude);
+    const key = (c, r) => `${c},${r}`;
+    const clampCol = (c) => Math.max(0, Math.min(maxCols - 1, c));
+    const clampRow = (r) => Math.max(0, Math.min(maxRows - 1, r));
+    let c = clampCol(col),
+      r = clampRow(row);
+    while (occupied.has(key(c, r))) {
+      r++;
+      if (r >= maxRows) {
+        r = 0;
+        c++;
+      }
+      if (c >= maxCols) {
+        c = 0;
+        r = 0;
+        break;
+      }
+    }
+    c = clampCol(c);
+    r = clampRow(r);
+    if (!occupied.has(key(c, r))) return { col: c, row: r };
+    const free = this.findAnyFreeCell(occupied, maxCols, maxRows);
+    if (free) return free;
+    return { col: c, row: r };
+  }
+
+  findAnyFreeCell(occupied, maxCols, maxRows) {
+    for (let r = 0; r < maxRows; r++) {
+      for (let c = 0; c < maxCols; c++) {
+        if (!occupied.has(`${c},${r}`)) return { col: c, row: r };
+      }
+    }
+    return null;
+  }
+
+  setPosition(icon, leftPx, topPx) {
+    icon.style.left = `${leftPx}px`;
+    icon.style.top = `${topPx}px`;
+  }
+
+  snap(icon, exclude = null) {
+    const xRaw = parseFloat(icon.style.left);
+    const yRaw = parseFloat(icon.style.top);
+    const x = Number.isFinite(xRaw) ? xRaw : 0;
+    const y = Number.isFinite(yRaw) ? yRaw : 0;
+    const { col, row } = this.pixelsToCell(x, y);
+    const effectiveExclude = exclude ?? icon;
+    const occupied = this.buildOccupancySet(effectiveExclude);
+    const free = this.nextFreeCell(col, row, effectiveExclude, occupied);
+    const { left, top } = this.cellToPixels(free.col, free.row);
+    this.setPosition(icon, left, top);
+  }
+
+  placeAtCell(icon, col, row, exclude = null) {
+    const effectiveExclude = exclude ?? icon;
+    const occupied = this.buildOccupancySet(effectiveExclude);
+    const free = this.nextFreeCell(col, row, effectiveExclude, occupied);
+    const { left, top } = this.cellToPixels(free.col, free.row);
+    this.setPosition(icon, left, top);
+  }
+
+  layoutSync(icons, isExplorerIcon = false, occupiedBefore = null) {
+    const gap = isExplorerIcon ? this.gridSize.gap * 6 : this.gridSize.gap;
+    const { width, height, marginX, marginY } = this.gridSize;
+    const cellW = width + gap,
+      cellH = height + gap;
+    const maxRows = Math.max(1, Math.floor((this.desktop.clientHeight - 2 * marginY) / cellH));
+    const maxCols = Math.max(1, Math.floor((this.desktop.clientWidth - 2 * marginX) / cellW));
+    const occupied = occupiedBefore ?? this.buildOccupancySet();
+    let col = 0,
+      row = 0;
+    icons.forEach((icon) => {
+      while (occupied.has(`${col},${row}`)) {
+        row++;
+        if (row >= maxRows) {
+          row = 0;
+          col++;
+        }
+        if (col >= maxCols) {
+          col = 0;
+          row = 0;
+          break;
+        }
+      }
+      if (occupied.has(`${col},${row}`)) {
+        const free = this.findAnyFreeCell(occupied, maxCols, maxRows);
+        if (free) {
+          col = free.col;
+          row = free.row;
+        }
+      }
+      occupied.add(`${col},${row}`);
+      icon.style.left = `${marginX + col * cellW}px`;
+      icon.style.top = `${marginY + row * cellH}px`;
+      row++;
+      if (row >= maxRows) {
+        row = 0;
+        col++;
+      }
+    });
+    return occupied;
+  }
+
+  layoutMacVerticalSync(icons, occupiedBefore = null) {
+    const { width, height, gap, marginX, marginY } = this.gridSize;
+    const cellW = width + gap,
+      cellH = height + gap;
+    const maxRows = Math.max(1, Math.floor((this.desktop.clientHeight - 2 * marginY) / cellH));
+    const maxCols = Math.max(1, Math.floor((this.desktop.clientWidth - 2 * marginX) / cellW));
+    const occupied = occupiedBefore ?? this.buildOccupancySet();
+    let col = maxCols - 1,
+      row = 0;
+    icons.forEach((icon) => {
+      while (occupied.has(`${col},${row}`)) {
+        row++;
+        if (row >= maxRows) {
+          row = 0;
+          col--;
+        }
+        if (col < 0) {
+          col = maxCols - 1;
+          row = 0;
+          break;
+        }
+      }
+      if (occupied.has(`${col},${row}`)) {
+        const free = this.findAnyFreeCell(occupied, maxCols, maxRows);
+        if (free) {
+          col = free.col;
+          row = free.row;
+        }
+      }
+      occupied.add(`${col},${row}`);
+      icon.style.left = `${marginX + col * cellW}px`;
+      icon.style.top = `${marginY + row * cellH}px`;
+      row++;
+      if (row >= maxRows) {
+        row = 0;
+        col--;
+      }
+    });
+  }
+
+  layout(icons, isExplorerIcon = false) {
+    const gap = isExplorerIcon ? this.gridSize.gap * 6 : this.gridSize.gap;
+    const { width, height, marginX, marginY } = this.gridSize;
+    const cellW = width + gap,
+      cellH = height + gap;
+    const maxRows = Math.max(1, Math.floor((this.desktop.clientHeight - 2 * marginY) / cellH));
+    const maxCols = Math.max(1, Math.floor((this.desktop.clientWidth - 2 * marginX) / cellW));
+    const occupied = this.buildOccupancySet();
+    let col = 0,
+      row = 0;
+    requestAnimationFrame(() => {
+      icons.forEach((icon) => {
+        while (occupied.has(`${col},${row}`)) {
+          row++;
+          if (row >= maxRows) {
+            row = 0;
+            col++;
+          }
+          if (col >= maxCols) {
+            col = 0;
+            row = 0;
+            break;
+          }
+        }
+        if (occupied.has(`${col},${row}`)) {
+          const free = this.findAnyFreeCell(occupied, maxCols, maxRows);
+          if (free) {
+            col = free.col;
+            row = free.row;
+          }
+        }
+        occupied.add(`${col},${row}`);
+        icon.style.left = `${marginX + col * cellW}px`;
+        icon.style.top = `${marginY + row * cellH}px`;
+        row++;
+        if (row >= maxRows) {
+          row = 0;
+          col++;
+        }
+      });
+    });
+  }
+
+  layoutSyncVertical(icons, isExplorerIcon = false, occupiedBefore = null) {
+    const gap = isExplorerIcon ? this.gridSize.gap * 6 : this.gridSize.gap;
+    const { width, height, marginX, marginY } = this.gridSize;
+    const cellW = width + gap,
+      cellH = height + gap;
+    const maxRows = Math.max(1, Math.floor((this.desktop.clientHeight - 2 * marginY) / cellH));
+    const maxCols = Math.max(1, Math.floor((this.desktop.clientWidth - 2 * marginX) / cellW));
+    const occupied = occupiedBefore || this.buildOccupancySet();
+    let col = 0,
+      row = 0;
+    icons.forEach((icon) => {
+      while (occupied.has(`${col},${row}`)) {
+        col++;
+        if (col >= maxCols) {
+          col = 0;
+          row++;
+        }
+        if (row >= maxRows) {
+          col = 0;
+          row = 0;
+          break;
+        }
+      }
+      if (occupied.has(`${col},${row}`)) {
+        const free = this.findAnyFreeCell(occupied, maxCols, maxRows);
+        if (free) {
+          col = free.col;
+          row = free.row;
+        }
+      }
+      occupied.add(`${col},${row}`);
+      icon.style.left = `${marginX + col * cellW}px`;
+      icon.style.top = `${marginY + row * cellH}px`;
+      col++;
+      if (col >= maxCols) {
+        col = 0;
+        row++;
+      }
+    });
+    return occupied;
+  }
+
+  layoutRight(icons) {
+    const { width, height, gap, marginX, marginY } = this.gridSize;
+    const cellW = width + gap,
+      cellH = height + gap;
+    const maxRows = Math.max(1, Math.floor((this.desktop.clientHeight - 2 * marginY) / cellH));
+    const maxCols = Math.max(1, Math.floor((this.desktop.clientWidth - 2 * marginX) / cellW));
+    const occupied = this.buildOccupancySet();
+    let col = maxCols - 1,
+      row = 0;
+    requestAnimationFrame(() => {
+      icons.forEach((icon) => {
+        while (occupied.has(`${col},${row}`)) {
+          row++;
+          if (row >= maxRows) {
+            row = 0;
+            col--;
+          }
+          if (col < 0) {
+            col = maxCols - 1;
+            row = 0;
+            break;
+          }
+        }
+        if (occupied.has(`${col},${row}`)) {
+          const free = this.findAnyFreeCell(occupied, maxCols, maxRows);
+          if (free) {
+            col = free.col;
+            row = free.row;
+          }
+        }
+        occupied.add(`${col},${row}`);
+        icon.style.left = `${marginX + col * cellW}px`;
+        icon.style.top = `${marginY + row * cellH}px`;
+        row++;
+        if (row >= maxRows) {
+          row = 0;
+          col--;
+        }
+      });
+    });
+  }
+}
+
+class DeletedIconsStore {
+  static load() {
+    const raw = os.storage.get(StorageKeys.deletedIconsKey);
+    try {
+      if (Array.isArray(raw)) return raw;
+      return [];
+    } catch {
+      return [];
+    }
+  }
+  static save(data) {
+    os.storage.set(StorageKeys.deletedIconsKey, data);
+  }
+  static add(key) {
+    const list = this.load();
+    if (!list.includes(key)) {
+      list.push(key);
+      this.save(list);
+    }
+  }
+  static has(key) {
+    return this.load().includes(key);
+  }
+  static remove(key) {
+    const list = this.load();
+    const next = list.filter((entry) => entry !== key);
+    if (next.length !== list.length) this.save(next);
+  }
+}
+
+export class PositionStore {
+  static load() {
+    try {
+      const stored = os.storage.get(StorageKeys.positionsKey);
+      if (stored !== undefined && stored !== null && typeof stored === "object") return stored;
+      return {};
+    } catch {
+      return {};
+    }
+  }
+  static save(map) {
+    os.storage.set(StorageKeys.positionsKey, map);
+  }
+  static getKey(icon) {
+    if (icon.dataset.folderName !== undefined && icon.dataset.folderName !== "") {
+      return `folder:${icon.dataset.folderName}`;
+    }
+    if (icon.dataset.fileName !== undefined && icon.dataset.fileName !== "") {
+      return `file:${icon.dataset.fileName}`;
+    }
+    return `app:${icon.dataset.app}:${IconDataHelper.getIconName(icon)}`;
+  }
+}
+
+class IconDataHelper {
+  static getIconName(icon) {
+    if (icon.dataset.fileName !== undefined && icon.dataset.fileName !== "") {
+      return icon.dataset.fileName.replace(/\.desktop$/, "");
+    }
+    if (icon.dataset.folderName !== undefined && icon.dataset.folderName !== "") {
+      return icon.dataset.folderName;
+    }
+    if (icon.dataset.app !== undefined && icon.dataset.app !== "") {
+      const lbl = icon.querySelector("div:last-child");
+      if (lbl !== null && typeof lbl.textContent === "string") {
+        const t = lbl.textContent.trim();
+        if (t.length > 0) return t;
+      }
+      return icon.dataset.app;
+    }
+    const el = icon.querySelector("div:last-child");
+    if (el !== null && typeof el.textContent === "string") {
+      const t = el.textContent.trim();
+      if (t.length > 0) return t;
+    }
+    return "Unknown";
+  }
+  static getIconPathMap() {
+    return {
+      explorer: resolveIconUrl("static/icons/file.webp"),
+      notepad: resolveIconUrl("static/icons/notepad.webp"),
+      flash: resolveIconUrl("static/icons/flash.webp"),
+      browser: resolveIconUrl("static/icons/chrome.webp"),
+      terminal: resolveIconUrl("static/icons/terminal.webp"),
+      music: resolveIconUrl("static/icons/spot.webp"),
+      cameraApp: resolveIconUrl("static/icons/obs.webp"),
+      paint: resolveIconUrl("static/icons/paint.webp"),
+      photopea: resolveIconUrl("static/icons/photopea.webp"),
+      vscode: resolveIconUrl("static/icons/vscode.webp"),
+      steamApp: "fab fa-steam",
+      return: resolveIconUrl("static/icons/file.webp")
+    };
+  }
+  static createDesktopFileData(app, name, path = null) {
+    const iconPathMap = this.getIconPathMap();
+    const appInfo = os.app.getAppInfo(app);
+    let fallback = "";
+    if (iconPathMap[app] !== undefined && iconPathMap[app] !== null && iconPathMap[app] !== "") {
+      fallback = iconPathMap[app];
+    } else if (appInfo?.icon !== undefined && appInfo.icon !== null && appInfo.icon !== "") {
+      fallback = appInfo.icon;
+    } else {
+      fallback = resolveIconUrl("static/icons/file.webp");
+    }
+    const effectivePath = path !== null && path !== undefined && path !== "" ? path : fallback;
+    return JSON.stringify({ app, name, path: effectivePath });
+  }
+}
+
+class SelectionManager {
+  constructor() {
+    this.selectedIcons = new Set();
+  }
+  add(icon) {
+    this.selectedIcons.add(icon);
+    icon.classList.add("selected");
+  }
+  remove(icon) {
+    this.selectedIcons.delete(icon);
+    icon.classList.remove("selected");
+    icon.style.zIndex = "";
+  }
+  toggle(icon) {
+    this.selectedIcons.has(icon) ? this.remove(icon) : this.add(icon);
+  }
+  clear() {
+    this.selectedIcons.forEach((i) => {
+      i.classList.remove("selected");
+      i.style.zIndex = "";
+    });
+    this.selectedIcons.clear();
+  }
+  has(icon) {
+    return this.selectedIcons.has(icon);
+  }
+  selectAll() {
+    this.clear();
+    $$(".icon.selectable").forEach((icon) => this.add(icon));
+  }
+  toArray() {
+    return Array.from(this.selectedIcons);
+  }
+  forEach(cb) {
+    this.selectedIcons.forEach(cb);
+  }
+}
+
+export class DesktopUI {
+  constructor(explorerApp) {
+    this.explorerApp = explorerApp;
+    this.desktop = $("#desktop");
+    this.startButton = $("#start-button");
+    this.startMenu = $("#start-menu");
+    applyStartButtonIcon();
+    try {
+      applyAppCustomizations();
+    } catch {}
+    this.selectionBox = $("#selection-box");
+    this.lastFocusedContext = "desktop";
+
+    this.positionHelper = new PositionHelper(this.desktop, GRID_CONFIG);
+    this.selectionManager = new SelectionManager();
+
+    this.iconManager = new IconManager(
+      this.desktop,
+      os.fs,
+      this.positionHelper,
+      PositionStore,
+      this.selectionManager,
+      null,
+      this.explorerApp,
+      null
+    );
+
+    this.dragDropManager = new DragDropManager(
+      this.desktop,
+      os.fs,
+      this.positionHelper,
+      PositionStore,
+      this.selectionManager,
+      this.iconManager,
+      IconDataHelper,
+      this.explorerApp
+    );
+
+    this.iconManager.dragDropManager = this.dragDropManager;
+
+    this.clipboardManager = new ClipboardManager(
+      os.fs,
+      PositionStore,
+      DeletedIconsStore,
+      this.iconManager,
+      IconDataHelper,
+      this.explorerApp
+    );
+
+    this.contextMenuManager = new DesktopContextMenuManager(this, PositionStore, IconDataHelper, os.window);
+
+    this.widgetManager = new WidgetManager();
+    this.widgetManager.registerWidgetType("clock", ClockWidget);
+    this.widgetManager.registerWidgetType("notes", NotesWidget);
+    this.widgetManager.registerWidgetType("weather", WeatherWidget);
+    this.widgetManager.registerWidgetType("calendar", CalendarWidget);
+    this.widgetManager.registerWidgetType("systemMonitor", SystemMonitorWidget);
+    this.widgetManager.registerWidgetType("musicControl", MusicControlWidget);
+    this.widgetManager.registerWidgetType("todo", TodoWidget);
+    this.widgetManager.registerWidgetType("power", PowerWidget);
+    this.widgetManager.registerWidgetType("clipboard", ClipboardWidget);
+    this.widgetManager.registerWidgetType("photoFrame", PhotoFrameWidget);
+    this.widgetManager.registerWidgetType("timer", TimerWidget);
+    this.widgetManager.registerWidgetType("youtube", YouTubeWidget);
+    this.widgetManager.registerWidgetType("aquarium", AquariumWidget);
+    this.widgetManager.registerWidgetType("rhythms", RhythmsWidget);
+    this.setupEventListeners();
+    this.initializeDesktopFiles();
+  }
+
+  setClipboard(data) {
+    this.clipboardManager.setClipboard(data);
+  }
+
+  getClipboard() {
+    return this.clipboardManager.getClipboard();
+  }
+
+  async dropFromExplorer(name, isFile, sourcePath, clientX, clientY) {
+    return this.dragDropManager.dropFromExplorer(name, isFile, sourcePath, clientX, clientY);
+  }
+
+  setupEventListeners() {
+    this.startButton.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.toggleStartMenu();
+      const favCat = $('.start-cat[data-cat="favorites"]');
+      const targetCat = favCat && favCat.style.display !== "none" ? favCat : $('.start-cat[data-cat="all"]');
+      targetCat?.click();
+    });
+    this.startButton.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      showStartButtonContextMenu(e);
+    });
+    this.startMenu.addEventListener("click", (e) => e.stopPropagation());
+    document.addEventListener("click", (e) => {
+      if (e.target.closest(".explorer-confirmation-overlay, .fd-dialog, #context-menu, #mac-menu-bar")) return;
+      this.closeAllMenus();
+    });
+    this.desktop.addEventListener("contextmenu", (e) => this.handleContextMenu(e));
+    this.setupIconHandlers();
+    this.setupInteractableSelection();
+    this.setupStartMenu();
+    this.setupKeyboardShortcuts();
+    this.setupBrowserDrop();
+  }
+
+  setupKeyboardShortcuts() {
+    let lastMousePos = { x: 50, y: 50 };
+    document.addEventListener("mousemove", (e) => {
+      lastMousePos = { x: e.pageX, y: e.pageY };
+    });
+
+    document.addEventListener("keydown", (e) => {
+      const active = document.activeElement;
+      if (active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA" || active.isContentEditable)) return;
+      if (KeybindManager.matches(e, "desktop.paste")) {
+        e.preventDefault();
+        const clipboard = this.clipboardManager.getClipboard();
+        if (!clipboard) return;
+        const explorerWins = $$("[id^='explorer-']");
+        let targetExplorerWin = null;
+
+        for (const win of explorerWins) {
+          const view = win.querySelector("[id$='-view']");
+          if (!view) continue;
+          const rect = view.getBoundingClientRect();
+          if (
+            lastMousePos.x >= rect.left &&
+            lastMousePos.x <= rect.right &&
+            lastMousePos.y >= rect.top &&
+            lastMousePos.y <= rect.bottom
+          ) {
+            targetExplorerWin = win;
+            break;
+          }
+        }
+
+        if (!targetExplorerWin) {
+          for (const win of explorerWins) {
+            if (win.contains(document.activeElement)) {
+              targetExplorerWin = win;
+              break;
+            }
+          }
+        }
+
+        if (targetExplorerWin) {
+          const inst = this.explorerApp?.getInstance(targetExplorerWin.id);
+          if (inst) {
+            const source = clipboard.source;
+            const iconsData = clipboard.icons;
+            const action = clipboard.action;
+            (async () => {
+              if (source === "explorer") {
+                await this.explorerApp.pasteToCurrentPath(inst);
+              } else {
+                for (const iconData of iconsData) {
+                  const appId = iconData.data.app;
+                  const tmp = createElement("div");
+                  tmp.innerHTML = iconData.data.innerHTML;
+                  const nameEl = tmp.querySelector("div:last-child");
+                  let iconName = "";
+                  if (nameEl !== null && typeof nameEl.textContent === "string") {
+                    const t = nameEl.textContent.trim();
+                    if (t.length > 0) iconName = t;
+                  }
+                  if (
+                    iconName === "" &&
+                    iconData.data.name !== undefined &&
+                    iconData.data.name !== null &&
+                    iconData.data.name !== ""
+                  ) {
+                    iconName = iconData.data.name;
+                  }
+                  if (iconName === "" && appId !== undefined && appId !== null && appId !== "") {
+                    iconName = appId;
+                  }
+                  const fileName = `${iconName}.desktop`;
+                  const fileContent = IconDataHelper.createDesktopFileData(appId, iconName);
+                  await os.fs.write([...inst.currentPath, fileName], fileContent);
+                  if (action === "cut" && iconData.element) iconData.element.remove();
+                }
+                if (action === "cut") this.clipboardManager.setClipboard(null);
+                await this.explorerApp.renderInstance(inst);
+                os.notify.send(`${iconsData.length} item${iconsData.length !== 1 ? "s" : ""} pasted`);
+              }
+            })();
+            e.stopImmediatePropagation();
+            return;
+          }
+        }
+        if (clipboard.source === "explorer" || clipboard.source === "desktop") {
+          (async () => {
+            await this.pasteToDesktop();
+          })();
+          e.stopImmediatePropagation();
+          return;
+        }
+      }
+
+      if (KeybindManager.matches(e, "desktop.copy")) {
+        const explorerWins = $$("[id^='explorer-']");
+        let anyExplorerFocused = false;
+        for (const win of explorerWins) {
+          if (isWindowFocused(win.id, lastMousePos)) {
+            anyExplorerFocused = true;
+            break;
+          }
+        }
+        if (anyExplorerFocused) return;
+        e.preventDefault();
+        const selectedArray = this.selectionManager.toArray();
+        if (selectedArray.length > 0) {
+          this.copySelectedIcons(selectedArray);
+          return;
+        }
+      }
+
+      if (KeybindManager.matches(e, "desktop.cut")) {
+        const explorerWins = $$("[id^='explorer-']");
+        let anyExplorerFocused = false;
+        for (const win of explorerWins) {
+          if (isWindowFocused(win.id, lastMousePos)) {
+            anyExplorerFocused = true;
+            break;
+          }
+        }
+        if (anyExplorerFocused) return;
+        e.preventDefault();
+        const selectedArray = this.selectionManager.toArray();
+        if (selectedArray.length > 0) {
+          this.cutSelectedIcons(selectedArray);
+          return;
+        }
+      }
+
+      if (KeybindManager.matches(e, "desktop.rename")) {
+        e.preventDefault();
+        const explorerWins = $$("[id^='explorer-']");
+        let anyExplorerFocused = false;
+        for (const win of explorerWins) {
+          if (isWindowFocused(win.id, lastMousePos)) {
+            anyExplorerFocused = true;
+            break;
+          }
+        }
+        if (anyExplorerFocused) return;
+        const selectedArray = this.selectionManager.toArray();
+        if (selectedArray.length === 1) {
+          const icon = selectedArray[0];
+          if (
+            icon.classList.contains("desktop-file-icon") ||
+            icon.classList.contains("folder-icon") ||
+            icon.dataset.app
+          ) {
+            this.contextMenuManager.startInlineDesktopRename(icon);
+          }
+        }
+      }
+
+      if (KeybindManager.matches(e, "desktop.deleteSelected")) {
+        const selectedArray = this.selectionManager.toArray();
+        let hasExplorerSelection = false;
+        let explorerInst = null;
+
+        if (this.explorerApp) {
+          for (const [winId, inst] of this.explorerApp.instances) {
+            if (inst.selectedItems.size > 0 && isWindowFocused(winId)) {
+              hasExplorerSelection = true;
+              explorerInst = inst;
+              break;
+            }
+          }
+        }
+
+        if (hasExplorerSelection && explorerInst) {
+          e.preventDefault();
+          (async () => {
+            const effectiveItems = [...explorerInst.selectedItems];
+            explorerInst.selectedItems = new Set();
+            for (const name of effectiveItems) {
+              await os.fs.trashFile(explorerInst.currentPath, name);
+            }
+            const explorerPath = explorerInst.currentPath;
+            const isDesktopPath = Array.isArray(explorerPath)
+              ? explorerPath.length === 1 && explorerPath[0] === "Desktop"
+              : explorerPath === "Desktop";
+            if (isDesktopPath) {
+              const cachedPositions = PositionStore.load();
+              let cachedDirty = false;
+              for (const name of effectiveItems) {
+                const fileKey = `file:${name}`;
+                const folderKey = `folder:${name}`;
+                if (cachedPositions[fileKey] !== undefined) {
+                  delete cachedPositions[fileKey];
+                  cachedDirty = true;
+                }
+                if (cachedPositions[folderKey] !== undefined) {
+                  delete cachedPositions[folderKey];
+                  cachedDirty = true;
+                }
+                DeletedIconsStore.add(fileKey);
+                DeletedIconsStore.add(folderKey);
+                const fileIcon = $(`.desktop-file-icon[data-file-name="${CSS.escape(name)}"]`);
+                if (fileIcon) {
+                  const resolvedKey = PositionStore.getKey(fileIcon);
+                  if (cachedPositions[resolvedKey] !== undefined) {
+                    delete cachedPositions[resolvedKey];
+                    cachedDirty = true;
+                  }
+                  DeletedIconsStore.add(resolvedKey);
+                  try {
+                    this.selectionManager.remove(fileIcon);
+                  } catch {}
+                  fileIcon.remove();
+                }
+                const folderIcon = $(`.folder-icon[data-folder-name="${CSS.escape(name)}"]`);
+                if (folderIcon) {
+                  const resolvedFolderKey = PositionStore.getKey(folderIcon);
+                  if (cachedPositions[resolvedFolderKey] !== undefined) {
+                    delete cachedPositions[resolvedFolderKey];
+                    cachedDirty = true;
+                  }
+                  DeletedIconsStore.add(resolvedFolderKey);
+                  try {
+                    this.selectionManager.remove(folderIcon);
+                  } catch {}
+                  folderIcon.remove();
+                }
+              }
+              if (cachedDirty) PositionStore.save(cachedPositions);
+            }
+            await this.explorerApp.renderInstance(explorerInst);
+            os.notify.send(`${effectiveItems.length} item${effectiveItems.length !== 1 ? "s" : ""} moved to trash`);
+          })();
+        } else if (selectedArray.length > 0) {
+          e.preventDefault();
+          this.clipboardManager.moveSelectedIconsToTrash(selectedArray, this.selectionManager);
+        }
+      }
+
+      if (KeybindManager.matches(e, "desktop.selectAll")) {
+        const explorerWins = $$("[id^='explorer-']");
+        let anyExplorerFocused = false;
+        for (const win of explorerWins) {
+          if (isWindowFocused(win.id, lastMousePos)) {
+            anyExplorerFocused = true;
+            break;
+          }
+        }
+        if (anyExplorerFocused) return;
+        e.preventDefault();
+        this.selectionManager.selectAll();
+      }
+
+      if (KeybindManager.matches(e, "desktop.physicsChaos")) {
+        const chaosExplorerWins = $$("[id^='explorer-']");
+        let chaosExplorerFocused = false;
+        for (const win of chaosExplorerWins) {
+          if (isWindowFocused(win.id, lastMousePos)) {
+            chaosExplorerFocused = true;
+            break;
+          }
+        }
+        if (chaosExplorerFocused) return;
+        e.preventDefault();
+        import("../shared/desktopPhysics.js").then((physicsModule) => {
+          physicsModule.togglePhysicsChaos();
+        });
+      }
+    });
+  }
+
+  setupBrowserDrop() {
+    const OVERLAY_ID = "browser-drop-overlay";
+
+    const getOverlay = () => $("#" + OVERLAY_ID);
+
+    const createOverlay = (label) => {
+      let el = getOverlay();
+      if (!el) {
+        el = createElement("div");
+        el.id = OVERLAY_ID;
+        el.className = "overlay";
+        document.body.appendChild(el);
+      }
+      el.classList.add("overlay--active");
+      el.innerHTML = `<span class="overlay__label">${label}</span>`;
+      return el;
+    };
+
+    const removeOverlay = () => {
+      const el = getOverlay();
+      if (el) el.remove();
+    };
+
+    const getExplorerInstanceAtPoint = (clientX, clientY) => {
+      if (!this.explorerApp) return null;
+      for (const [winId, inst] of this.explorerApp.instances) {
+        if (inst.mode !== "browse") continue;
+        const win = $("#" + winId);
+        if (!win) continue;
+        const view = win.querySelector(`#${winId}-view`);
+        if (!view) continue;
+        const r = view.getBoundingClientRect();
+        if (clientX >= r.left && clientX <= r.right && clientY >= r.top && clientY <= r.bottom) {
+          return inst;
+        }
+      }
+      return null;
+    };
+
+    const hasBrowserFiles = (dt) => {
+      if (!dt) return false;
+      for (const item of dt.items) {
+        if (item.kind === "file") return true;
+      }
+      return false;
+    };
+
+    let dragCounter = 0;
+
+    document.addEventListener("dragenter", (e) => {
+      if (!hasBrowserFiles(e.dataTransfer)) return;
+      dragCounter++;
+      if (dragCounter !== 1) return;
+      e.preventDefault();
+      const inst = getExplorerInstanceAtPoint(e.clientX, e.clientY);
+      const label = inst
+        ? `Drop to save here → ${inst.currentPath.length ? inst.currentPath.join("/") : "Home"}`
+        : "Drop to save to Desktop";
+      createOverlay(label);
+    });
+
+    document.addEventListener("dragover", (e) => {
+      if (!hasBrowserFiles(e.dataTransfer)) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "copy";
+      const overlay = getOverlay();
+      if (!overlay) return;
+      const inst = getExplorerInstanceAtPoint(e.clientX, e.clientY);
+      const label = inst
+        ? `Drop to save here → ${inst.currentPath.length ? inst.currentPath.join("/") : "Home"}`
+        : "Drop to save to Desktop";
+      const span = overlay.querySelector("span");
+      if (span) span.textContent = label;
+    });
+
+    document.addEventListener("dragleave", (e) => {
+      if (!hasBrowserFiles(e.dataTransfer)) return;
+      dragCounter = Math.max(0, dragCounter - 1);
+      if (dragCounter === 0) removeOverlay();
+    });
+
+    document.addEventListener("drop", async (e) => {
+      dragCounter = 0;
+      removeOverlay();
+
+      if (!hasBrowserFiles(e.dataTransfer)) return;
+      e.preventDefault();
+
+      const files = Array.from(e.dataTransfer.files);
+      if (!files.length) return;
+
+      const inst = getExplorerInstanceAtPoint(e.clientX, e.clientY);
+
+      if (inst && this.explorerApp) {
+        const win = $("#" + inst.winId);
+        await this.explorerApp.handleFileUpload(files, false, win, inst);
+        return;
+      }
+
+      let uploadedCount = 0;
+      for (const file of files) {
+        try {
+          const { kind, content, icon, isBinary, isBinaryOffice } = await resolveFilePayload(file, file.name);
+          const destExists = await os.fs.exists(["Desktop", file.name]);
+
+          let finalName = file.name;
+          let action = "replace";
+          if (destExists) {
+            const result = await showConflictDialog(file.name);
+            if (result.action === "skip") continue;
+            action = result.action;
+            if (action === "keep") {
+              finalName = await os.fs.getUniqueFileName(["Desktop"], file.name);
+            }
+          }
+
+          const isBinaryWrite = kind === FileKind.VIDEO || isBinaryOffice || isBinary;
+          if (destExists && action === "replace") {
+            if (isBinaryWrite) {
+              await os.fs.deleteBinaryFile(["Desktop"], file.name).catch(() => {});
+            } else {
+              await os.fs.delete(["Desktop"], file.name).catch(() => {});
+            }
+          }
+          if (isBinaryWrite) {
+            await os.fs.writeBinaryFile(["Desktop"], finalName, content, kind, icon);
+          } else {
+            await os.fs.createFile(["Desktop"], finalName, content, kind, icon);
+          }
+          uploadedCount++;
+        } catch (e) {
+          console.error(`[DesktopDrop] Could not save "${file.name}":`, e);
+          os.notify.send(`Could not save "${file.name}"`);
+        }
+      }
+      if (uploadedCount > 0) {
+        os.notify.send(`${uploadedCount} file${uploadedCount !== 1 ? "s" : ""} saved to Desktop`);
+      }
+    });
+  }
+
+  closeStartMenu() {
+    if (isIntroTourKeepingStartMenuOpen()) return;
+    this.startMenu.classList.add("closing");
+    this.startMenu.addEventListener(
+      "animationend",
+      () => {
+        this.startMenu.classList.remove("closing");
+        this.startMenu.style.display = "none";
+      },
+      { once: true }
+    );
+  }
+
+  toggleStartMenu() {
+    if (isStartMenuBlocked()) return;
+    if (this.startMenu.style.display === "flex") {
+      this.closeStartMenu();
+    } else {
+      this.startMenu.style.display = "flex";
+      updateFavoritesUI();
+    }
+  }
+
+  closeAllMenus() {
+    if (this.startMenu.style.display === "flex") this.closeStartMenu();
+    hideMenu();
+  }
+
+  handleContextMenu(e) {
+    this.contextMenuManager.handleContextMenu(e);
+  }
+
+  setupIconHandlers() {
+    const deleted = DeletedIconsStore.load();
+    $$(".icon.selectable").forEach((icon) => {
+      const key = PositionStore.getKey(icon);
+      if (deleted.includes(key)) {
+        icon.remove();
+        return;
+      }
+      this.iconManager.makeIconInteractable(icon);
+    });
+  }
+
+  handleIconSelection(icon, isCtrlKey) {
+    if (!isCtrlKey) {
+      if (!this.selectionManager.has(icon)) {
+        this.selectionManager.clear();
+        this.selectionManager.add(icon);
+      }
+    } else {
+      this.selectionManager.toggle(icon);
+    }
+    $$(".icon.selectable").forEach((i) => {
+      if (!this.selectionManager.has(i)) {
+        setStyle(i, { zIndex: "", opacity: "", cursor: "" });
+      }
+    });
+  }
+
+  setupInteractDrag(icon) {
+    return makeDraggable(icon, {
+      start: () => this.dragDropManager.onDragStart(),
+      move: (e, dx, dy, clientX, clientY) => {
+        this.dragDropManager.onDragMove({ dx, dy, clientX, clientY });
+      },
+      end: () => this.dragDropManager.onDragEnd()
+    });
+  }
+
+  setupInteractableSelection() {
+    let selectionState = { startX: 0, startY: 0, isActive: false };
+    let selRafId = null;
+    let selLastX = 0,
+      selLastY = 0;
+
+    const onMouseDown = (e) => {
+      if (e.target !== this.desktop) return;
+      if (e.target?.closest?.(".window")) return;
+      this.lastFocusedContext = "desktop";
+      $$(".icon.selectable").forEach((i) => {
+        setStyle(i, { zIndex: "", opacity: "", cursor: "" });
+      });
+      selectionState = { startX: e.pageX, startY: e.pageY, isActive: true };
+      Object.assign(this.selectionBox.style, {
+        left: `${e.pageX}px`,
+        top: `${e.pageY}px`,
+        width: "0px",
+        height: "0px",
+        display: "block"
+      });
+      this.selectionManager.clear();
+      document.addEventListener("mousemove", onMouseMove);
+      document.addEventListener("mouseup", onMouseUp);
+    };
+
+    const onMouseMove = (e) => {
+      if (!selectionState.isActive) return;
+      selLastX = e.pageX;
+      selLastY = e.pageY;
+      Object.assign(this.selectionBox.style, {
+        width: `${Math.abs(e.pageX - selectionState.startX)}px`,
+        height: `${Math.abs(e.pageY - selectionState.startY)}px`,
+        left: `${Math.min(e.pageX, selectionState.startX)}px`,
+        top: `${Math.min(e.pageY, selectionState.startY)}px`
+      });
+      if (selRafId) return;
+      selRafId = requestAnimationFrame(() => {
+        selRafId = null;
+        const boxRect = this.selectionBox.getBoundingClientRect();
+        $$(".icon.selectable").forEach((icon) => {
+          if (icon.style.display === "none") return;
+          const r = icon.getBoundingClientRect();
+          const overlaps = rectsIntersect(r, boxRect);
+          if (overlaps) this.selectionManager.add(icon);
+          else this.selectionManager.remove(icon);
+        });
+      });
+    };
+
+    const onMouseUp = () => {
+      if (!selectionState.isActive) return;
+      this.selectionBox.style.display = "none";
+      selectionState.isActive = false;
+      document.removeEventListener("mousemove", onMouseMove);
+      document.removeEventListener("mouseup", onMouseUp);
+    };
+
+    this.desktop.addEventListener("mousedown", onMouseDown);
+  }
+
+  setupStartMenu() {
+    setupStartMenuFn(null);
+  }
+
+  async initializeDesktopFiles() {
+    await this.iconManager.initializeDesktopFiles();
+    try {
+      applyAppCustomizations();
+    } catch {}
+    this.widgetManager.init();
+  }
+
+  async loadDesktopItems() {
+    await this.iconManager.loadDesktopItems();
+    const deletedList = DeletedIconsStore.load();
+    const deletedSet = new Set(deletedList);
+    const savedPositions = PositionStore.load();
+    let positionsDirty = false;
+    const desktopIcons = $$(".icon.selectable");
+    for (const icon of desktopIcons) {
+      const iconKey = PositionStore.getKey(icon);
+      if (deletedSet.has(iconKey)) {
+        try {
+          this.selectionManager.remove(icon);
+        } catch {}
+        icon.remove();
+        if (savedPositions[iconKey] !== undefined) {
+          delete savedPositions[iconKey];
+          positionsDirty = true;
+        }
+        continue;
+      }
+      const desktopFileName = icon.dataset.fileName;
+      const desktopFolderName = icon.dataset.folderName;
+      const checkName = desktopFileName || desktopFolderName;
+      if (checkName) {
+        let stillExists = true;
+        try {
+          stillExists = await os.fs.exists(["Desktop", checkName]);
+        } catch {
+          stillExists = true;
+        }
+        if (!stillExists) {
+          try {
+            this.selectionManager.remove(icon);
+          } catch {}
+          icon.remove();
+          if (savedPositions[iconKey] !== undefined) {
+            delete savedPositions[iconKey];
+            positionsDirty = true;
+          }
+        }
+      }
+    }
+    if (positionsDirty) PositionStore.save(savedPositions);
+    const autoSort = os.storage.get(StorageKeys.desktopAutoSort);
+    if (autoSort === true || autoSort === "true") {
+      const storedMode = os.storage.get(StorageKeys.desktopSortMode);
+      const mode = storedMode !== undefined && storedMode !== null && storedMode !== "" ? storedMode : "name";
+      if (mode !== "none") {
+        sortDesktopIcons(mode);
+      }
+    }
+  }
+
+  async createFolderIcon(folderName) {
+    return this.iconManager.createFolderIcon(folderName);
+  }
+
+  async createDesktopFileIcon(fileName, itemData = null) {
+    return this.iconManager.createDesktopFileIcon(fileName, itemData);
+  }
+
+  async openDesktopFile(fileName) {
+    return this.iconManager.openDesktopFile(fileName);
+  }
+
+  openYouTubeEmbedDesktop(content) {
+    this.iconManager.openYouTubeEmbedDesktop(content);
+  }
+
+  async editDesktopFileWithNotepad(fileName) {
+    return this.iconManager.editDesktopFileWithNotepad(fileName);
+  }
+
+  async saveToWallpapers(name, content, kind, icon) {
+    return this.iconManager.saveToWallpapers(name, content, kind, icon);
+  }
+
+  addFiles() {
+    this.iconManager.addFiles();
+  }
+
+  async showPropertiesDialog(icon) {
+    if (icon.dataset.fileName) {
+      showFileProperties(["Desktop", icon.dataset.fileName], icon.dataset.fileName, false);
+    } else if (icon.dataset.folderName) {
+      showFileProperties(["Desktop", icon.dataset.folderName], icon.dataset.folderName, true);
+    } else if (icon.dataset.app) {
+      const name = IconDataHelper.getIconName(icon);
+      const fileName = `${name}.desktop`;
+      const filePath = ["Desktop", fileName];
+      const img = icon.querySelector("img");
+      const fa = icon.querySelector("i");
+      let iconPath = null;
+      if (img) iconPath = img.getAttribute("src");
+      else if (fa) iconPath = Array.from(fa.classList).join(" ");
+      const content = JSON.stringify({ app: icon.dataset.app, name, path: iconPath });
+      await os.fs.write(filePath, content);
+      showFileProperties(filePath, fileName, false);
+    }
+  }
+
+  deleteSelectedIcons(selectedArray) {
+    return this.clipboardManager.deleteSelectedIcons(selectedArray, this.selectionManager);
+  }
+
+  moveSelectedIconsToTrash(selectedArray) {
+    return this.clipboardManager.moveSelectedIconsToTrash(selectedArray, this.selectionManager);
+  }
+
+  cutSelectedIcons(selectedArray) {
+    this.clipboardManager.setClipboard(this.clipboardManager.buildDesktopClipboard("cut", selectedArray));
+    selectedArray.forEach((icon) => {
+      this.selectionManager.remove(icon);
+      icon.remove();
+    });
+  }
+
+  copySelectedIcons(selectedArray) {
+    this.clipboardManager.setClipboard(this.clipboardManager.buildDesktopClipboard("copy", selectedArray));
+  }
+
+  buildDesktopClipboard(action, icons) {
+    return this.clipboardManager.buildDesktopClipboard(action, icons);
+  }
+
+  pasteToDesktop() {
+    return this.clipboardManager.pasteToDesktop();
+  }
+}
+
+function layoutIconsCall() {
+  relayoutDesktopIcons();
+}
+
+let resizeTimer;
+window.addEventListener("load", () => layoutIconsCall());
+window.addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => layoutIconsCall(), 150);
+});
+
+function resetIconDragState() {
+  const helper = new PositionHelper(desktop, GRID_CONFIG);
+  $$(".icon.selectable").forEach((icon) => {
+    const zIndex = parseInt(icon.style.zIndex);
+    if (zIndex > 10 || icon.style.opacity === "0.7" || icon.style.cursor === "move") {
+      helper.snap(icon);
+      setStyle(icon, { zIndex: "", opacity: "", cursor: "" });
+    }
+  });
+}
+
+document.addEventListener("mouseup", resetIconDragState);
+
+document.addEventListener("click", (e) => {
+  if (e.target.closest(".icon")) return;
+  resetIconDragState();
+});
+
+window.addEventListener("focus", resetIconDragState);
+
+setInterval(() => {
+  $$(".icon.selectable").forEach((icon) => {
+    const zIndex = parseInt(icon.style.zIndex);
+    if (zIndex > 10 || icon.style.opacity === "0.7" || icon.style.cursor === "move") {
+      setStyle(icon, { zIndex: "", opacity: "", cursor: "" });
+    }
+  });
+}, 5000);
+
+export function sortDesktopIcons(mode) {
+  os.storage.set(StorageKeys.desktopSortMode, mode);
+  const allIcons = Array.from(desktop.querySelectorAll(":scope > .icon")).filter(
+    (icon) => icon.style.display !== "none"
+  );
+  if (!allIcons.length) return;
+  if (desktop.clientWidth === 0 || desktop.clientHeight === 0) return;
+
+  const withKey = allIcons.map((icon) => {
+    const labelEl = icon.querySelector("div:last-child");
+    const rawLabel = labelEl?.textContent?.trim();
+    const label = rawLabel !== undefined && rawLabel !== null ? rawLabel : "";
+    let key;
+    switch (mode) {
+      case "name":
+        key = label.toLowerCase();
+        break;
+      case "type":
+        if (icon.classList.contains("folder-icon")) key = `0:${label}`;
+        else if (icon.dataset.app !== undefined && icon.dataset.app !== "") key = `1:${label}`;
+        else key = `2:${label}`;
+        break;
+      case "recent": {
+        const appId = icon.dataset.app;
+        if (appId !== undefined && appId !== null && appId !== "") {
+          const stored = os.storage.get(StorageKeys.launchTimePrefix + appId);
+          const parsed = Number(stored);
+          const timeVal = Number.isFinite(parsed) ? parsed : 0;
+          key = -timeVal;
+        } else {
+          key = 0;
+        }
+        break;
+      }
+      default:
+        key = 0;
+    }
+    return { icon, key };
+  });
+
+  withKey.sort((a, b) => {
+    if (typeof a.key === "string" && typeof b.key === "string") return a.key.localeCompare(b.key);
+    const aVal = typeof a.key === "number" && Number.isFinite(a.key) ? a.key : 0;
+    const bVal = typeof b.key === "number" && Number.isFinite(b.key) ? b.key : 0;
+    return aVal - bVal;
+  });
+
+  const positionHelper = new PositionHelper(desktop, GRID_CONFIG);
+  const regularIcons = withKey.map(({ icon }) => icon);
+
+  allIcons.forEach((i) => {
+    i.style.left = "";
+    i.style.top = "";
+    i.style.zIndex = "";
+  });
+  const storedAlign = os.storage.get(StorageKeys.desktopIconAlignment);
+  const alignment =
+    storedAlign !== undefined && storedAlign !== null && storedAlign !== "" ? storedAlign : "horizontal";
+  let occupied = new Set();
+  if (regularIcons.length) {
+    occupied =
+      alignment === "vertical"
+        ? positionHelper.layoutSyncVertical(regularIcons, false, occupied)
+        : positionHelper.layoutSync(regularIcons, false, occupied);
+  }
+
+  const saved = {};
+  allIcons.forEach((icon) => {
+    const leftRaw = parseFloat(icon.style.left);
+    const topRaw = parseFloat(icon.style.top);
+    const left = Number.isFinite(leftRaw) ? leftRaw : 0;
+    const top = Number.isFinite(topRaw) ? topRaw : 0;
+    const { col, row } = positionHelper.pixelsToCell(left, top);
+    saved[PositionStore.getKey(icon)] = { col, row };
+  });
+  PositionStore.save(saved);
+}

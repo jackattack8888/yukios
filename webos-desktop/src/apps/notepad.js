@@ -1,0 +1,886 @@
+import "../styles/notepad.css";
+import { ClippyAnimation, speak } from "../ai/clippy.js";
+import { $, $$, setStyle, BaseApp, os, createElement, ServiceKeys } from "../framework.js";
+import { resolveIconUrl } from "../shared/assetResolver.js";
+import { KeybindManager } from "../keybindManager.js";
+import { showAboutDialog } from "../shared/aboutDialog.js";
+import { escapeHtml } from "../utils/utils.js";
+export class NotepadApp extends BaseApp {
+  constructor(services) {
+    super(services);
+    this.idleTimer = null;
+    this.idleDelay = 15000;
+    this.instances = new Map();
+  }
+
+  open(titleOrOptions = "Untitled", content = "", filePath = null) {
+    let title = "Untitled";
+    let options = {};
+    if (titleOrOptions && typeof titleOrOptions === "object" && !Array.isArray(titleOrOptions)) {
+      options = titleOrOptions;
+      title = options.title || "Untitled";
+      content = options.content || "";
+      filePath = options.filePath || null;
+    } else {
+      title = titleOrOptions || "Untitled";
+    }
+
+    const winId = options.forceId || `notepad-${Date.now()}`;
+
+    const win = os.window.create(winId, `${title} - Notepad`, "800px", "600px", {
+      ...options,
+      icon: "static/icons/notepad.webp"
+    });
+
+    const htmlContent = `
+      <div class="app-menubar">
+        <div class="app-menubar-item" data-menu="file">
+          <span>File</span>
+          <div class="notepad-dropdown">
+            <div class="dropdown-item" data-action="new">New</div>
+            <div class="dropdown-item" data-action="open">Open from YukiOS<span class="shortcut">Ctrl+O</span></div>
+            <div class="dropdown-item" data-action="openFromComputer">Open from Computer</div>
+            <div class="dropdown-item" data-action="save">Save<span class="shortcut">Ctrl+S</span></div>
+            <div class="dropdown-item" data-action="saveAs">Save As...<span class="shortcut">Ctrl+Shift+S</span></div>
+            <div class="dropdown-separator"></div>
+            <div class="dropdown-item" data-action="exit">Exit</div>
+          </div>
+        </div>
+        <div class="app-menubar-item" data-menu="edit">
+          <span>Edit</span>
+          <div class="notepad-dropdown">
+            <div class="dropdown-item" data-action="find">Find...<span class="shortcut">Ctrl+F</span></div>
+            <div class="dropdown-item" data-action="findNext">Find Next<span class="shortcut">F3</span></div>
+            <div class="dropdown-item" data-action="findPrev">Find Previous<span class="shortcut">Shift+F3</span></div>
+            <div class="dropdown-item" data-action="replace">Replace...<span class="shortcut">Ctrl+H</span></div>
+            <div class="dropdown-item" data-action="goTo">Go To...<span class="shortcut">Ctrl+G</span></div>
+          </div>
+        </div>
+        <div class="app-menubar-item" data-menu="format">
+          <span>Format</span>
+          <div class="notepad-dropdown">
+            <div class="dropdown-item" data-action="wordWrap"><span class="checkmark" style="visibility:visible">✓</span>Word Wrap</div>
+            <div class="dropdown-item" data-action="font">Font...</div>
+          </div>
+        </div>
+        <div class="app-menubar-item" data-menu="view">
+          <span>View</span>
+          <div class="notepad-dropdown">
+            <div class="dropdown-submenu">
+              <div class="dropdown-item submenu-trigger">Zoom<span class="arrow">▶</span></div>
+              <div class="submenu">
+                <div class="dropdown-item" data-action="zoomIn">Zoom In<span class="shortcut">Ctrl++</span></div>
+                <div class="dropdown-item" data-action="zoomOut">Zoom Out<span class="shortcut">Ctrl+-</span></div>
+                <div class="dropdown-item" data-action="zoomReset">Restore Default<span class="shortcut">Ctrl+0</span></div>
+              </div>
+            </div>
+            <div class="dropdown-separator"></div>
+            <div class="dropdown-item" data-action="statusBar"><span class="checkmark" style="visibility:visible">✓</span>Status Bar</div>
+          </div>
+        </div>
+        <div class="app-menubar-item" data-menu="help">
+          <span>Help</span>
+          <div class="notepad-dropdown">
+            <div class="dropdown-item" data-action="about">About Notepad</div>
+          </div>
+        </div>
+      </div>
+      <div class="window-content notepad-content">
+        <textarea class="notepad-textarea">${escapeHtml(content)}</textarea>
+        <div class="notepad-statusbar">
+          <span class="status-position">Ln 1, Col 1</span>
+          <span class="status-zoom">100%</span>
+        </div>
+      </div>
+    `;
+
+    win.classList.add("notepad-window");
+    win.classList.add("notepad-window");
+    win.innerHTML = htmlContent;
+
+    this.instances.set(winId, {
+      modified: false,
+      currentTitle: title,
+      currentPath: filePath,
+      baseFontSize: 14,
+      wordWrap: true,
+      zoom: 100,
+      statusBarVisible: true,
+      findText: "",
+      matchCase: false
+    });
+
+    this.setupMenus(win, winId);
+    this.setupTextarea(win, winId);
+    this.setupKeyboardShortcuts(win, winId);
+    this.setupIdleDetection(win);
+    this.setupCleanup(win, winId);
+
+    const textarea = $(".notepad-textarea", win);
+    setStyle(textarea, { whiteSpace: "pre-wrap", overflowX: "hidden" });
+    const instance = this.instances.get(winId);
+    setStyle(textarea, { fontSize: (instance?.baseFontSize || 14) + "px" });
+
+    this.updateStatusBar(win, winId);
+  }
+
+  get explorerApp() {
+    return os.app.getInstance(ServiceKeys.EXPLORER);
+  }
+
+  markModified(win, winId) {
+    this.instances.get(winId).modified = true;
+    this.updateTitle(win, winId);
+    this.updateStatusBar(win, winId);
+  }
+
+  createDialog(win, html, style) {
+    this.closeDialogs(win);
+    const dialog = createElement("div");
+    dialog.className = "notepad-dialog";
+    dialog.innerHTML = html;
+    if (style) setStyle(dialog, style);
+    $(".notepad-content", win).appendChild(dialog);
+    return dialog;
+  }
+
+  bindDialogButtons(dialog, bindings) {
+    for (const [selector, handler] of Object.entries(bindings)) {
+      const el = $(selector, dialog);
+      if (el) el.onclick = handler;
+    }
+  }
+
+  setupMenus(win, winId) {
+    const menuItems = $$(".app-menubar-item", win);
+    let activeMenu = null;
+
+    const closeAllMenus = () => {
+      menuItems.forEach((m) => m.classList.remove("active"));
+      activeMenu = null;
+    };
+
+    menuItems.forEach((menuItem) => {
+      menuItem.addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (menuItem.classList.contains("active")) {
+          closeAllMenus();
+        } else {
+          closeAllMenus();
+          menuItem.classList.add("active");
+          activeMenu = menuItem;
+        }
+      });
+
+      menuItem.addEventListener("mouseenter", () => {
+        if (activeMenu && activeMenu !== menuItem) {
+          closeAllMenus();
+          menuItem.classList.add("active");
+          activeMenu = menuItem;
+        }
+      });
+    });
+
+    $$(".dropdown-item[data-action]", win).forEach((item) => {
+      item.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this.handleAction(win, winId, item.dataset.action);
+        closeAllMenus();
+      });
+    });
+
+    const closeHandler = (e) => {
+      if (!win.contains(e.target)) closeAllMenus();
+    };
+    document.addEventListener("click", closeHandler);
+    win.addEventListener("remove", () => document.removeEventListener("click", closeHandler));
+  }
+
+  updateStatusBar(win, winId) {
+    const textarea = $(".notepad-textarea", win);
+    const statusPosition = $(".status-position", win);
+    const statusZoom = $(".status-zoom", win);
+    const instance = this.instances.get(winId);
+
+    if (!textarea || !statusPosition || !instance) return;
+
+    const text = textarea.value.substring(0, textarea.selectionStart);
+    const lines = text.split("\n");
+    statusPosition.textContent = `Ln ${lines.length}, Col ${lines[lines.length - 1].length + 1}`;
+    if (statusZoom) statusZoom.textContent = `${instance.zoom}%`;
+  }
+
+  setupTextarea(win, winId) {
+    const textarea = $(".notepad-textarea", win);
+    const refresh = () => this.updateStatusBar(win, winId);
+
+    textarea.addEventListener("input", () => this.markModified(win, winId));
+    textarea.addEventListener("keydown", () => setTimeout(refresh, 0));
+    ["click", "keyup", "focus", "select", "mouseup"].forEach((ev) => textarea.addEventListener(ev, refresh));
+  }
+
+  updateTitle(win, winId) {
+    const instance = this.instances.get(winId);
+    const newTitle = `${instance.modified ? "*" : ""}${instance.currentTitle} - Notepad`;
+    os.window.setTitle(winId, newTitle);
+  }
+
+  setupKeyboardShortcuts(win, winId) {
+    win.addEventListener("keydown", (e) => {
+      if (KeybindManager.matches(e, "notepad.save")) {
+        e.preventDefault();
+        this.handleAction(win, winId, "save");
+      } else if (KeybindManager.matches(e, "notepad.saveAs")) {
+        e.preventDefault();
+        this.handleAction(win, winId, "saveAs");
+      } else if (KeybindManager.matches(e, "notepad.open")) {
+        e.preventDefault();
+        this.handleAction(win, winId, "open");
+      } else if (KeybindManager.matches(e, "notepad.find")) {
+        e.preventDefault();
+        this.handleAction(win, winId, "find");
+      } else if (KeybindManager.matches(e, "notepad.replace")) {
+        e.preventDefault();
+        this.handleAction(win, winId, "replace");
+      } else if (KeybindManager.matches(e, "notepad.goto")) {
+        e.preventDefault();
+        this.handleAction(win, winId, "goTo");
+      } else if (KeybindManager.matches(e, "notepad.zoomIn")) {
+        e.preventDefault();
+        this.handleAction(win, winId, "zoomIn");
+      } else if (KeybindManager.matches(e, "notepad.zoomOut")) {
+        e.preventDefault();
+        this.handleAction(win, winId, "zoomOut");
+      } else if (KeybindManager.matches(e, "notepad.zoomReset")) {
+        e.preventDefault();
+        this.handleAction(win, winId, "zoomReset");
+      } else if (KeybindManager.matches(e, "notepad.findNext")) {
+        e.preventDefault();
+        this.handleAction(win, winId, "findNext");
+      } else if (KeybindManager.matches(e, "notepad.findPrev")) {
+        e.preventDefault();
+        this.handleAction(win, winId, "findPrev");
+      } else if (KeybindManager.matches(e, "notepad.closeDialog")) {
+        this.closeDialogs(win);
+      }
+    });
+  }
+
+  handleAction(win, winId, action) {
+    const actions = {
+      new: () => this.newFile(win, winId),
+      open: () => this.openFileDialog(win, winId),
+      openFromComputer: () => this.openFromComputer(win, winId),
+      save: () => this.saveFile(win, winId),
+      saveAs: () => this.saveAsFile(win, winId),
+      exit: () => this.closeWindow(win, winId),
+      find: () => this.showFindDialog(win, winId),
+      findNext: () => this.findNext(win, winId),
+      findPrev: () => this.findPrev(win, winId),
+      replace: () => this.showReplaceDialog(win, winId),
+      goTo: () => this.showGoToDialog(win, winId),
+      wordWrap: () => this.toggleWordWrap(win, winId),
+      font: () => this.showFontDialog(win, winId),
+      zoomIn: () => this.zoom(win, winId, 10),
+      zoomOut: () => this.zoom(win, winId, -10),
+      zoomReset: () => this.zoomReset(win, winId),
+      statusBar: () => this.toggleStatusBar(win, winId),
+      about: () => this.showAboutDialog(win)
+    };
+    actions[action]?.();
+  }
+
+  newFile(win, winId) {
+    const instance = this.instances.get(winId);
+    if (instance.modified) {
+      this.showSaveConfirmDialog(win, winId, () => this.resetEditor(win, winId));
+      return;
+    }
+    this.resetEditor(win, winId);
+  }
+
+  resetEditor(win, winId) {
+    const instance = this.instances.get(winId);
+    const textarea = $(".notepad-textarea", win);
+    textarea.value = "";
+    instance.currentTitle = "Untitled";
+    instance.currentPath = null;
+    instance.modified = false;
+    this.updateTitle(win, winId);
+    this.updateStatusBar(win, winId);
+  }
+
+  showSaveConfirmDialog(win, winId, onDiscard, onSave = null) {
+    const instance = this.instances.get(winId);
+    const dialog = this.createDialog(
+      win,
+      `
+      <h3>Do you want to save changes to ${instance.currentTitle}?</h3>
+      <div class="notepad-dialog-buttons">
+        <button class="save-btn primary">Save</button>
+        <button class="dont-save-btn">Don't Save</button>
+        <button class="cancel-btn">Cancel</button>
+      </div>
+    `,
+      { top: "50%", left: "50%", transform: "translate(-50%, -50%)" }
+    );
+
+    this.bindDialogButtons(dialog, {
+      ".save-btn": () => {
+        dialog.remove();
+        if (onSave) {
+          onSave();
+        } else {
+          this.saveFile(win, winId);
+        }
+      },
+      ".dont-save-btn": () => {
+        dialog.remove();
+        onDiscard();
+      },
+      ".cancel-btn": () => dialog.remove()
+    });
+  }
+
+  onFileSaved(win, winId, title, path) {
+    const instance = this.instances.get(winId);
+    instance.currentTitle = title;
+    instance.currentPath = path;
+    instance.modified = false;
+    this.updateTitle(win, winId);
+    speak("Great, your file has been saved!", ClippyAnimation.Greeting);
+  }
+
+  saveFile(win, winId, onSuccess = null) {
+    const instance = this.instances.get(winId);
+    if (!instance.currentPath) {
+      this.saveAsFile(win, winId, onSuccess);
+      return;
+    }
+
+    const content = $(".notepad-textarea", win).value;
+    const filePath = [...instance.currentPath, instance.currentTitle];
+    os.fs
+      .write(filePath, content)
+      .then(() => {
+        this.onFileSaved(win, winId, instance.currentTitle, instance.currentPath);
+        if (onSuccess) {
+          onSuccess();
+        }
+      })
+      .catch((e) => {
+        console.error(e);
+        os.notify.send("Error saving file.", "", { type: "error" });
+      });
+  }
+
+  saveAsFile(win, winId, onSuccess = null) {
+    const instance = this.instances.get(winId);
+    const defaultName = instance.currentTitle.includes(".") ? instance.currentTitle : `${instance.currentTitle}.txt`;
+
+    this.explorerApp.openSaveDialog(defaultName, (path, fileName) => {
+      const content = $(".notepad-textarea", win).value;
+      const filePath = [...path, fileName];
+      os.fs
+        .write(filePath, content, { kind: "text", icon: "static/icons/notepad.webp" })
+        .then(() => {
+          this.onFileSaved(win, winId, fileName, path);
+          const pathStr = path.length ? `/${path.join("/")}/${fileName}` : `/${fileName}`;
+          if (onSuccess) {
+            onSuccess();
+          }
+        })
+        .catch((e) => {
+          console.error(e);
+          os.notify.send("Error saving file.", "", { type: "error" });
+        });
+    });
+  }
+
+  openFileDialog(win, winId) {
+    speak("Looking for something?", ClippyAnimation.Searching);
+    this.explorerApp.open(async (path, fileName) => {
+      const filePath = [...path, fileName];
+      const content = await os.fs.read(filePath);
+      const instance = this.instances.get(winId);
+      const textarea = $(".notepad-textarea", win);
+      textarea.value = content;
+      instance.currentTitle = fileName;
+      instance.currentPath = path;
+      instance.modified = false;
+      this.updateTitle(win, winId);
+      this.updateStatusBar(win, winId);
+    }, this);
+  }
+
+  openFromComputer(win, winId) {
+    const instance = this.instances.get(winId);
+    if (!instance) return;
+    const triggerFilePicker = () => {
+      const input = createElement("input");
+      input.type = "file";
+      input.onchange = (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          const content = ev.target.result;
+          const textarea = $(".notepad-textarea", win);
+          textarea.value = content;
+          instance.currentTitle = file.name;
+          instance.currentPath = null;
+          instance.modified = false;
+          this.updateTitle(win, winId);
+          this.updateStatusBar(win, winId);
+        };
+        reader.readAsText(file);
+      };
+      input.click();
+    };
+
+    if (instance.modified) {
+      this.showSaveConfirmDialog(win, winId, triggerFilePicker, () => {
+        this.saveFile(win, winId, triggerFilePicker);
+      });
+    } else {
+      triggerFilePicker();
+    }
+  }
+
+  closeWindow(win, winId, onConfirmClose = null) {
+    const instance = this.instances.get(winId);
+    if (!instance) return;
+
+    const doClose = () => {
+      if (onConfirmClose) {
+        onConfirmClose();
+      } else {
+        os.window.close(win);
+      }
+    };
+
+    if (instance.modified) {
+      this.showSaveConfirmDialog(
+        win,
+        winId,
+        () => {
+          doClose();
+        },
+        () => {
+          this.saveFile(win, winId, () => {
+            doClose();
+          });
+        }
+      );
+      return;
+    }
+    doClose();
+  }
+
+  showFindDialog(win, winId) {
+    const instance = this.instances.get(winId);
+    const dialog = this.createDialog(
+      win,
+      `
+      <h3>Find</h3>
+      <div class="notepad-dialog-row">
+        <label>Find what:</label>
+        <input type="text" class="find-input" value="${instance.findText || ""}" />
+      </div>
+      <div class="notepad-dialog-row">
+        <label class="notepad-dialog-checkbox">
+          <input type="checkbox" class="match-case" ${instance.matchCase ? "checked" : ""} />
+          Match case
+        </label>
+      </div>
+      <div class="notepad-dialog-buttons">
+        <button class="find-next-btn primary">Find Next</button>
+        <button class="find-prev-btn">Find Previous</button>
+        <button class="cancel-btn">Cancel</button>
+      </div>
+    `,
+      { top: "60px", right: "30px" }
+    );
+
+    const input = $(".find-input", dialog);
+    const matchCase = $(".match-case", dialog);
+
+    const syncAndRun = (direction) => {
+      instance.findText = input.value;
+      instance.matchCase = matchCase.checked;
+      direction === "next" ? this.findNext(win, winId) : this.findPrev(win, winId);
+    };
+
+    this.bindDialogButtons(dialog, {
+      ".find-next-btn": () => syncAndRun("next"),
+      ".find-prev-btn": () => syncAndRun("prev"),
+      ".cancel-btn": () => dialog.remove()
+    });
+
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") syncAndRun("next");
+    });
+    input.focus();
+    input.select();
+  }
+
+  searchText(win, winId, direction) {
+    const instance = this.instances.get(winId);
+    if (!instance.findText) {
+      this.showFindDialog(win, winId);
+      return;
+    }
+
+    const textarea = $(".notepad-textarea", win);
+    const text = textarea.value;
+    const searchIn = instance.matchCase ? text : text.toLowerCase();
+    const searchFor = instance.matchCase ? instance.findText : instance.findText.toLowerCase();
+    const len = instance.findText.length;
+
+    let index;
+    if (direction === "next") {
+      index = searchIn.indexOf(searchFor, textarea.selectionEnd);
+      if (index === -1 && textarea.selectionEnd > 0) index = searchIn.indexOf(searchFor, 0);
+    } else {
+      index = searchIn.lastIndexOf(searchFor, textarea.selectionStart - 1);
+      if (index === -1 && textarea.selectionStart < text.length) index = searchIn.lastIndexOf(searchFor);
+    }
+
+    if (index !== -1) {
+      textarea.focus();
+      textarea.setSelectionRange(index, index + len);
+      this.updateStatusBar(win, winId);
+    } else {
+      os.notify.send("Search", `Cannot find "${instance.findText}"`);
+    }
+  }
+
+  findNext(win, winId) {
+    this.searchText(win, winId, "next");
+  }
+  findPrev(win, winId) {
+    this.searchText(win, winId, "prev");
+  }
+
+  showReplaceDialog(win, winId) {
+    const instance = this.instances.get(winId);
+    const dialog = this.createDialog(
+      win,
+      `
+      <h3>Replace</h3>
+      <div class="notepad-dialog-row">
+        <label>Find what:</label>
+        <input type="text" class="find-input" value="${instance.findText || ""}" />
+      </div>
+      <div class="notepad-dialog-row">
+        <label>Replace with:</label>
+        <input type="text" class="replace-input" />
+      </div>
+      <div class="notepad-dialog-row">
+        <label class="notepad-dialog-checkbox">
+          <input type="checkbox" class="match-case" ${instance.matchCase ? "checked" : ""} />
+          Match case
+        </label>
+      </div>
+      <div class="notepad-dialog-buttons">
+        <button class="find-next-btn">Find Next</button>
+        <button class="replace-btn">Replace</button>
+        <button class="replace-all-btn primary">Replace All</button>
+        <button class="cancel-btn">Cancel</button>
+      </div>
+    `,
+      { top: "60px", right: "30px" }
+    );
+
+    const findInput = $(".find-input", dialog);
+    const replaceInput = $(".replace-input", dialog);
+    const matchCase = $(".match-case", dialog);
+    const textarea = $(".notepad-textarea", win);
+
+    const syncInstance = () => {
+      instance.findText = findInput.value;
+      instance.matchCase = matchCase.checked;
+    };
+
+    this.bindDialogButtons(dialog, {
+      ".find-next-btn": () => {
+        syncInstance();
+        this.findNext(win, winId);
+      },
+      ".replace-btn": () => {
+        const selected = textarea.value.substring(textarea.selectionStart, textarea.selectionEnd);
+        const findText = findInput.value;
+        const replaceText = replaceInput.value;
+        const cmp = (s) => (matchCase.checked ? s : s.toLowerCase());
+
+        if (cmp(selected) === cmp(findText)) {
+          const start = textarea.selectionStart;
+          textarea.value =
+            textarea.value.substring(0, start) + replaceText + textarea.value.substring(textarea.selectionEnd);
+          textarea.selectionStart = textarea.selectionEnd = start + replaceText.length;
+          this.markModified(win, winId);
+        }
+        syncInstance();
+        this.findNext(win, winId);
+      },
+      ".replace-all-btn": () => {
+        const findText = findInput.value;
+        if (!findText) return;
+        const replaceText = replaceInput.value;
+        const newText = matchCase.checked
+          ? textarea.value.split(findText).join(replaceText)
+          : textarea.value.replace(new RegExp(findText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), replaceText);
+        const count =
+          Math.abs(Math.round((textarea.value.length - newText.length) / (findText.length - replaceText.length))) || 0;
+        textarea.value = newText;
+        this.markModified(win, winId);
+      },
+      ".cancel-btn": () => dialog.remove()
+    });
+
+    findInput.focus();
+    findInput.select();
+  }
+
+  showGoToDialog(win, winId) {
+    const textarea = $(".notepad-textarea", win);
+    const currentLine = textarea.value.substring(0, textarea.selectionStart).split("\n").length;
+
+    const dialog = this.createDialog(
+      win,
+      `
+      <h3>Go To Line</h3>
+      <div class="notepad-dialog-row">
+        <label>Line number:</label>
+        <input type="number" class="line-input" min="1" value="${currentLine}" />
+      </div>
+      <div class="notepad-dialog-buttons">
+        <button class="goto-btn primary">Go To</button>
+        <button class="cancel-btn">Cancel</button>
+      </div>
+    `,
+      { top: "60px", right: "30px" }
+    );
+
+    const input = $(".line-input", dialog);
+
+    const goToLine = () => {
+      const lineNum = parseInt(input.value);
+      const allLines = textarea.value.split("\n");
+      if (lineNum < 1 || lineNum > allLines.length) {
+        os.notify.send("Go To Line", `Line number must be between 1 and ${allLines.length}`);
+        return;
+      }
+      let pos = 0;
+      for (let i = 0; i < lineNum - 1; i++) pos += allLines[i].length + 1;
+      textarea.focus();
+      textarea.setSelectionRange(pos, pos);
+      this.updateStatusBar(win, winId);
+      dialog.remove();
+    };
+
+    this.bindDialogButtons(dialog, {
+      ".goto-btn": goToLine,
+      ".cancel-btn": () => dialog.remove()
+    });
+
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") goToLine();
+    });
+    input.focus();
+    input.select();
+  }
+
+  toggleWordWrap(win, winId) {
+    const instance = this.instances.get(winId);
+    const textarea = $(".notepad-textarea", win);
+    const checkmark = $('[data-action="wordWrap"] .checkmark', win);
+    instance.wordWrap = !instance.wordWrap;
+    setStyle(textarea, {
+      whiteSpace: instance.wordWrap ? "pre-wrap" : "pre",
+      overflowX: instance.wordWrap ? "hidden" : "auto"
+    });
+    checkmark.style.visibility = instance.wordWrap ? "visible" : "hidden";
+  }
+
+  parseFontStyle(styleValue) {
+    return {
+      fontWeight: styleValue.includes("bold") ? "bold" : "normal",
+      fontStyle: styleValue.includes("italic") ? "italic" : "normal"
+    };
+  }
+
+  showFontDialog(win, winId) {
+    const textarea = $(".notepad-textarea", win);
+    const computed = window.getComputedStyle(textarea);
+
+    const currentFamily = textarea.style.fontFamily || computed.fontFamily;
+    const currentSize = parseInt(textarea.style.fontSize) || parseInt(computed.fontSize) || 14;
+    const isBold =
+      (textarea.style.fontWeight || computed.fontWeight) === "bold" ||
+      parseInt(textarea.style.fontWeight || computed.fontWeight) >= 700;
+    const isItalic = (textarea.style.fontStyle || computed.fontStyle) === "italic";
+    const currentStyleValue = isBold && isItalic ? "bold italic" : isBold ? "bold" : isItalic ? "italic" : "normal";
+
+    const fontFamilies = [
+      { label: "Consolas", value: "Consolas, monospace" },
+      { label: "Courier New", value: "'Courier New', monospace" },
+      { label: "Lucida Console", value: "'Lucida Console', monospace" },
+      { label: "Monaco", value: "Monaco, monospace" },
+      { label: "Fira Code", value: "'Fira Code', monospace" },
+      { label: "JetBrains Mono", value: "'JetBrains Mono', monospace" },
+      { label: "Arial", value: "Arial, sans-serif" },
+      { label: "Segoe UI", value: "'Segoe UI', sans-serif" },
+      { label: "Verdana", value: "Verdana, sans-serif" }
+    ];
+
+    const toOptions = (arr, selectedFn) =>
+      arr
+        .map(({ label, value }) => `<option value="${value}" ${selectedFn(value) ? "selected" : ""}>${label}</option>`)
+        .join("");
+
+    const fontStyleOptions = [
+      { label: "Regular", value: "normal" },
+      { label: "Italic", value: "italic" },
+      { label: "Bold", value: "bold" },
+      { label: "Bold Italic", value: "bold italic" }
+    ];
+
+    const sizes = [8, 9, 10, 11, 12, 14, 16, 18, 20, 22, 24, 26, 28, 36, 48, 72];
+
+    const dialog = this.createDialog(
+      win,
+      `
+      <h3>Font</h3>
+      <div class="notepad-dialog-row">
+        <label>Font:</label>
+        <select class="font-family">${toOptions(fontFamilies, (v) => currentFamily.includes(v.split(",")[0].replace(/'/g, "")))}</select>
+      </div>
+      <div class="notepad-dialog-row">
+        <label>Style:</label>
+        <select class="font-style">${toOptions(fontStyleOptions, (v) => v === currentStyleValue)}</select>
+      </div>
+      <div class="notepad-dialog-row">
+        <label>Size:</label>
+        <select class="font-size">${sizes.map((s) => `<option value="${s}" ${s === currentSize ? "selected" : ""}>${s}</option>`).join("")}</select>
+      </div>
+      <div class="notepad-dialog-row">
+        <label>Preview:</label>
+        <div class="font-preview" style="border:1px solid var(--text-secondary);padding:6px 10px;min-height:30px;font-size:${currentSize}px;font-family:${currentFamily}">AaBbCcXxYyZz</div>
+      </div>
+      <div class="notepad-dialog-buttons">
+        <button class="ok-btn primary">OK</button>
+        <button class="cancel-btn">Cancel</button>
+      </div>
+    `,
+      { top: "60px", right: "30px" }
+    );
+
+    const fontFamilyEl = $(".font-family", dialog);
+    const fontStyleEl = $(".font-style", dialog);
+    const fontSizeEl = $(".font-size", dialog);
+    const preview = $(".font-preview", dialog);
+
+    const updatePreview = () => {
+      const { fontWeight, fontStyle } = this.parseFontStyle(fontStyleEl.value);
+      setStyle(preview, {
+        fontFamily: fontFamilyEl.value,
+        fontSize: fontSizeEl.value + "px",
+        fontWeight,
+        fontStyle
+      });
+    };
+
+    [fontFamilyEl, fontStyleEl, fontSizeEl].forEach((el) => el.addEventListener("change", updatePreview));
+
+    this.bindDialogButtons(dialog, {
+      ".ok-btn": () => {
+        const { fontWeight, fontStyle } = this.parseFontStyle(fontStyleEl.value);
+        const instance = this.instances.get(winId);
+        setStyle(textarea, {
+          fontFamily: fontFamilyEl.value,
+          fontSize: fontSizeEl.value + "px",
+          fontWeight,
+          fontStyle
+        });
+        instance.baseFontSize = parseInt(fontSizeEl.value);
+        instance.zoom = 100;
+        this.updateStatusBar(win, winId);
+        dialog.remove();
+      },
+      ".cancel-btn": () => dialog.remove()
+    });
+  }
+
+  zoom(win, winId, delta) {
+    const instance = this.instances.get(winId);
+    if (!instance) return;
+    const textarea = $(".notepad-textarea", win);
+    instance.zoom = Math.max(10, Math.min(500, instance.zoom + delta));
+    setStyle(textarea, { fontSize: (instance.baseFontSize * instance.zoom) / 100 + "px" });
+    this.updateStatusBar(win, winId);
+  }
+
+  zoomReset(win, winId) {
+    const instance = this.instances.get(winId);
+    if (!instance) return;
+    const textarea = $(".notepad-textarea", win);
+    instance.zoom = 100;
+    setStyle(textarea, { fontSize: instance.baseFontSize + "px" });
+    this.updateStatusBar(win, winId);
+  }
+
+  toggleStatusBar(win, winId) {
+    const instance = this.instances.get(winId);
+    const statusBar = $(".notepad-statusbar", win);
+    const checkmark = $('[data-action="statusBar"] .checkmark', win);
+    instance.statusBarVisible = !instance.statusBarVisible;
+    setStyle(statusBar, { display: instance.statusBarVisible ? "flex" : "none" });
+    checkmark.style.visibility = instance.statusBarVisible ? "visible" : "hidden";
+  }
+
+  showAboutDialog(win) {
+    showAboutDialog({
+      title: "Notepad",
+      version: "1.0.0",
+      description: "A simple text editor for YukiOS.",
+      icon: "static/icons/notepad.webp",
+      iconType: "image"
+    });
+  }
+
+  closeDialogs(win) {
+    $$(".notepad-dialog", win).forEach((d) => d.remove());
+  }
+
+  setupCleanup(win, winId) {
+    const observer = new MutationObserver(() => {
+      if (!document.contains(win)) {
+        this.instances.delete(winId);
+        if (this.idleTimer) clearTimeout(this.idleTimer);
+        observer.disconnect();
+      }
+    });
+    const desktop = $("#desktop");
+    if (desktop) observer.observe(desktop, { childList: true });
+  }
+
+  setupIdleDetection(win) {
+    const textarea = $(".notepad-textarea", win);
+    const resetIdleTimer = () => {
+      if (this.idleTimer) clearTimeout(this.idleTimer);
+      if (textarea.value.trim().length > 0) {
+        this.idleTimer = setTimeout(
+          () => speak("Still there? I can check your spelling.", ClippyAnimation.IdleEyeBrowRaise),
+          this.idleDelay
+        );
+      }
+    };
+    textarea.addEventListener("input", resetIdleTimer);
+    textarea.addEventListener("keydown", resetIdleTimer);
+  }
+
+  loadContent(fileName, content, filePath) {
+    this.open(fileName, content, filePath);
+  }
+}

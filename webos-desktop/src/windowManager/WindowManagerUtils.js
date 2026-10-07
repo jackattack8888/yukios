@@ -1,0 +1,280 @@
+import { $, createElement } from "../shared/domUtils.js";
+import { resolveIconUrl } from "../shared/assetResolver.js";
+import { getEffectiveIcon } from "../shared/iconPack.js";
+import { sanitizeTitle } from "../utils/utils.js";
+import { os } from "../framework.js";
+import { StorageKeys } from "../StorageKeys.js";
+import { CLOAK_PRESETS } from "../stealth/tabCloak.js";
+import { isImageFile } from "../fileDisplay.js";
+import { updateTransparency } from "./transparencyManager.js";
+import { getSetting } from "../utils/utils.js";
+import {
+  buildControlsForStyle,
+  buildHeaderForStyle,
+  resolveHeaderStyleId,
+  getStoredHeaderStyleId
+} from "./headerStyles.js";
+
+export class WindowManagerUtils {
+  constructor(manager) {
+    this.manager = manager;
+  }
+
+  init() {
+    this.initVisibilityTracking();
+  }
+
+  applyWindowLayout(win) {
+    const root = win.querySelector(".browser-root");
+    if (!root) return;
+
+    const header = win.querySelector(".window-header");
+    const tabbar = root.querySelector(".browser-tabbar");
+
+    if (!header || !tabbar) return;
+
+    const controls = header.querySelector(".window-controls");
+    if (!controls) return;
+
+    tabbar.appendChild(controls);
+
+    header.style.display = "none";
+
+    controls.style.marginLeft = "auto";
+    controls.style.display = "flex";
+    controls.style.alignItems = "center";
+    controls.style.height = "100%";
+  }
+
+  resolveIconType(iconValue) {
+    const isDataUrl = typeof iconValue === "string" && iconValue.startsWith("data:");
+    const isHttpUrl = typeof iconValue === "string" && /^https?:\/\//.test(iconValue);
+    const isPapirus = typeof iconValue === "string" && iconValue.startsWith("papirus:");
+    return {
+      isImage: isImageFile(iconValue) || isHttpUrl || isPapirus,
+      isDataUrl
+    };
+  }
+
+  getFaviconLink() {
+    let link = $("link[rel~='icon']");
+    return link;
+  }
+
+  reassertCloak() {
+    if (window.__yukiCloakActive !== true) return false;
+    let key = null;
+    try {
+      key = os.storage.get(StorageKeys.tabCloak) || null;
+    } catch {
+      key = null;
+    }
+    const preset = (key && CLOAK_PRESETS[key]) || null;
+    if (!preset) return true;
+    document.title = preset.title;
+    try {
+      let link = this.getFaviconLink();
+      if (!link) {
+        link = createElement("link");
+        link.rel = "icon";
+        document.head.appendChild(link);
+      }
+      link.href = preset.icon;
+    } catch {
+      /* ignore */
+    }
+    return true;
+  }
+
+  getOpenWindowCount() {
+    return this.manager.openWindows.size;
+  }
+
+  getWindowNormalGeometry(win) {
+    const entry = this.manager.openWindows.get(win.id);
+    const rect = win.getBoundingClientRect();
+    let x = rect.left;
+    let y = rect.top;
+    let width = rect.width;
+    let height = rect.height;
+    const parsePixelVal = (val, fallback) => {
+      if (typeof val === "string" && val.endsWith("px")) {
+        const num = parseInt(val);
+        if (!isNaN(num)) return num;
+      }
+      return fallback;
+    };
+    if (win.dataset.snapZone && entry?.record?.preSnapGeometry) {
+      x = entry.record.preSnapGeometry.x ?? x;
+      y = entry.record.preSnapGeometry.y ?? y;
+      width = entry.record.preSnapGeometry.width ?? width;
+      height = entry.record.preSnapGeometry.height ?? height;
+    } else if (win.dataset.fullscreen === "true") {
+      x = parsePixelVal(win.dataset.prevLeft, x);
+      y = parsePixelVal(win.dataset.prevTop, y);
+      width = parsePixelVal(win.dataset.prevWidth, width);
+      height = parsePixelVal(win.dataset.prevHeight, height);
+    } else {
+      x = parsePixelVal(win.style.left, x);
+      y = parsePixelVal(win.style.top, y);
+      width = parsePixelVal(win.style.width, width);
+      height = parsePixelVal(win.style.height, height);
+    }
+    return { x, y, width, height };
+  }
+
+  getWindowIconHtml(iconValue, color = null) {
+    if (!iconValue) return "";
+    iconValue = getEffectiveIcon(iconValue);
+    const isPapirusRaw = typeof iconValue === "string" && iconValue.startsWith("papirus:");
+    if (isPapirusRaw) {
+      const src = resolveIconUrl(iconValue);
+      const size = 16;
+      return `<img src="${src}" class="papirus-icon papirus-icon--16" style="width:${size}px;height:${size}px;margin-right:6px;vertical-align:middle;object-fit:contain;" />`;
+    }
+    iconValue = resolveIconUrl(iconValue);
+    const size = 16;
+    const { isImage, isDataUrl } = this.resolveIconType(iconValue);
+
+    if (isImage || isDataUrl) {
+      return `<img src="${iconValue}" style="width:${size}px;height:${size}px;margin-right:6px;vertical-align:middle;object-fit:contain;" />`;
+    } else if (typeof iconValue === "string" && iconValue.length > 0) {
+      const cls = iconValue.startsWith("fa") ? iconValue : `fa ${iconValue}`;
+      const clr = color ?? "white";
+      return `<i class="${cls}" style="color:${clr};margin-right:6px;font-size:${size}px;vertical-align:middle;"></i>`;
+    }
+    return "";
+  }
+
+  generateWindowHeader(title, iconValue, color = null, externalUrl = null, macStyle = null) {
+    const iconHtml = this.getWindowIconHtml(iconValue, color);
+    const controlsHtml = this.getWindowControls(externalUrl);
+    let styleId;
+    if (macStyle === true) styleId = "mac";
+    else if (macStyle === false) styleId = getStoredHeaderStyleId() ?? "default";
+    else styleId = resolveHeaderStyleId();
+    return buildHeaderForStyle(title, iconHtml, controlsHtml, styleId);
+  }
+
+  updatePageFavicon(iconValue, title) {
+    if (this.reassertCloak()) return;
+    document.title = sanitizeTitle(title) || this.manager.initialTitle;
+    const link = this.getFaviconLink();
+    iconValue = resolveIconUrl(iconValue);
+    const { isImage, isDataUrl } = this.resolveIconType(iconValue);
+    if (isImage || isDataUrl) {
+      link.href = iconValue;
+    } else {
+      link.href = this.manager.initialFavicon || "";
+    }
+  }
+
+  resetToDefaultState() {
+    if (this.reassertCloak()) return;
+    document.title = this.manager.initialTitle;
+    const link = this.getFaviconLink();
+    link.href = this.manager.initialFavicon || "";
+  }
+
+  initVisibilityTracking() {
+    document.addEventListener("visibilitychange", () => {
+      if (window.__yukiCloakActive === true) return;
+      if (document.hidden) {
+        document.title = this.manager.initialTitle;
+        this.getFaviconLink().href = this.manager.initialFavicon || "";
+      } else {
+        if (this.manager.openWindows.size === 0) {
+          this.resetToDefaultState();
+        } else {
+          const activeEntry =
+            Array.from(this.manager.openWindows.values()).findLast((entry) =>
+              entry.taskbarItem?.classList.contains("active")
+            ) ?? Array.from(this.manager.openWindows.values()).pop();
+          if (activeEntry) this.updatePageFavicon(activeEntry.iconValue, activeEntry.title);
+        }
+      }
+    });
+  }
+
+  downloadWindowContent(win) {
+    const filename =
+      (this.manager.getWindowTitle(win.id)?.trim() || win.id).replace(/[^\w\s-]/g, "").trim() || "window";
+
+    const iframe = win.querySelector("iframe");
+    if (iframe) {
+      const src = iframe.src || "";
+
+      if (!src || src === "about:blank" || src === "") {
+        return;
+      }
+
+      if (src.startsWith("blob:")) {
+        try {
+          const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
+          if (iframeDoc) {
+            const html = iframeDoc.documentElement?.outerHTML ?? "";
+            this.saveHtmlAsFile(html, filename);
+          }
+        } catch (e) {}
+        return;
+      }
+
+      if (src.startsWith("data:")) {
+        const a = createElement("a");
+        a.href = src;
+        a.download = filename + ".html";
+        a.click();
+        return;
+      }
+
+      try {
+        const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
+        if (iframeDoc) {
+          const html = iframeDoc.documentElement?.outerHTML ?? "";
+          this.saveHtmlAsFile(html, filename);
+          return;
+        }
+      } catch (e) {}
+
+      const a = createElement("a");
+      a.href = src;
+      a.download = filename + ".html";
+      a.target = "blank";
+      a.rel = "noopener noreferrer";
+      a.click();
+      return;
+    }
+
+    const content = win.querySelector(".window-content");
+    const html = content ? content.innerHTML : win.outerHTML;
+    this.saveHtmlAsFile(html, filename);
+  }
+
+  saveHtmlAsFile(html, filename) {
+    const blob = new Blob([html], { type: "text/html" });
+    const url = URL.createObjectURL(blob);
+    const a = createElement("a");
+    a.href = url;
+    a.download = filename + ".html";
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  getWindowControls(externalUrl, showDownload = false) {
+    return buildControlsForStyle(resolveHeaderStyleId(), externalUrl, showDownload);
+  }
+
+  findAppIdByWinId(winId) {
+    const gamesList = window.gamesList;
+    if (!gamesList || !gamesList.appMap) return null;
+
+    for (const [appId, appData] of Object.entries(gamesList.appMap)) {
+      if (appData.id === winId) return appId;
+    }
+    return null;
+  }
+
+  updateTransparency() {
+    updateTransparency(this.manager);
+  }
+}

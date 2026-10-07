@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en" style="background: #1e1e1e">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="preconnect" href="https://cdn.jsdelivr.net" />
+    <link rel="preconnect" href="https://static.cloudflareinsights.com" />
+
+    <link
+      rel="preload"
+      as="style"
+      href="https://fonts.googleapis.com/css2?family=Outfit:wght@100;200;300;400;500;600;700;800;900&family=Share+Tech+Mono&family=Barlow:wght@300;400;500;600&display=swap"
+    />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Outfit:wght@100;200;300;400;500;600;700;800;900&family=Share+Tech+Mono&family=Barlow:wght@300;400;500;600&display=swap"
+      media="print"
+      onload="this.media = 'all'"
+    />
+    <script
+      type="module"
+      src="https://static.cloudflareinsights.com/beacon.min.js"
+      data-cf-beacon='{"token": "2fef78db02bd4ab593e4a78cc531c0bd"}'
+    ></script>
+    <!-- End Cloudflare Web Analytics -->
+    <base href="./" />
+
+    <title>YukiOS</title>
+    <meta
+      name="description"
+      content="YukiOS is a free browser-based desktop environment with a tiling window manager, macOS-style interface, 3000 games, a terminal with Python &amp; Git, emulators for DOS/Flash/x86/3DS, and 90+ apps - no sign-up or download required. Open source with MIT license."
+    />
+
+    <meta property="og:title" content="YukiOS - Free Desktop Environment in Your Browser, No Download Needed" />
+
+    <meta
+      property="og:description"
+      content="Turn your browser into a full desktop OS with YukiOS. Tiling window manager, Mac desktop mode, 3000 free games, Python/Node terminal, DOS/Flash/x86 emulators, 90+ apps - all in one browser tab."
+    />
+
+    <meta name="twitter:title" content="YukiOS - Free Desktop Environment in Your Browser, No Install Needed" />
+    <meta property="og:type" content="website" />
+    <meta property="og:image" content="https://cdn.jsdelivr.net/gh/Reeyuki/YukiOS@main/.github/yuki-deck.png" />
+    <meta property="og:image:width" content="1920" />
+    <meta property="og:image:height" content="1080" />
+    <meta
+      property="og:image:alt"
+      content="YukiOS browser-based desktop environment showing windowed multitasking with apps, taskbar, and start menu"
+    />
+    <meta property="og:site_name" content="YukiOS" />
+    <meta property="og:url" content="https://yukios.netlify.app" />
+    <meta property="og:locale" content="en_US" />
+
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta
+      name="twitter:description"
+      content="Browser desktop OS with tiling WM, Mac mode, 3000 games, Python/Node terminal, emulators for DOS/Flash/x86/3DS, themes, wallpapers, PWA support, and 90+ apps - completely free and no download."
+    />
+    <meta name="twitter:image" content="https://cdn.jsdelivr.net/gh/Reeyuki/YukiOS@main/.github/yuki-deck.png" />
+    <meta
+      name="twitter:image:alt"
+      content="YukiOS browser-based desktop environment showing windowed multitasking with apps, taskbar, and start menu"
+    />
+
+    <meta name="application-name" content="YukiOS" />
+    <meta name="theme-color" content="#1e1e1e" />
+    <meta name="google-site-verification" content="6D2EMAqnKo-MEhFnlXuyqliO-87DFoI3hfAsWer0KKg" />
+    <link rel="canonical" href="https://yukios.netlify.app/" />
+    <link rel="icon" href="favicon.ico" />
+    <link rel="preload" as="image" href="src/assets/logo.png" />
+    <script>
+      (function () {
+        try {
+          var href = new URL("manifest.webmanifest", window.location.href).toString();
+          var link = document.createElement("link");
+          link.rel = "manifest";
+          link.href = href;
+          document.head.appendChild(link);
+        } catch (e) {}
+      })();
+    </script>
+
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "YukiOS",
+        "applicationCategory": "WebApplication",
+        "applicationSubCategory": "DesktopEnvironment",
+        "operatingSystem": "Web Browser (Chrome, Firefox, Edge, Safari)",
+        "url": "https://yukios.netlify.app",
+        "description": "YukiOS is a browser-based desktop operating system with windowed multitasking, a virtual filesystem, 90+ built-in applications, and persistent storage.",
+        "featureList": [
+          "Windowed desktop environment",
+          "Virtual filesystem with persistent storage",
+          "90+ built-in applications",
+          "Browser-based code editor",
+          "Integrated terminal with Python and Node.js REPLs",
+          "Desktop notifications",
+          "Command palette",
+          "PWA support with offline caching",
+          "Custom wallpapers and themes",
+          "User profiles and session management",
+          "Emulators: Flash, DOS, x86, 3DS",
+          "Window tiling manager"
+        ],
+        "screenshot": "https://cdn.jsdelivr.net/gh/Reeyuki/YukiOS@main/.github/yuki-deck.png",
+        "image": "https://cdn.jsdelivr.net/gh/Reeyuki/YukiOS@main/.github/steam.png",
+        "offers": {
+          "@type": "Offer",
+          "price": "0",
+          "priceCurrency": "USD"
+        },
+        "applicationSuite": "YukiOS",
+        "genre": ["Desktop Environment", "Web Application", "Productivity"],
+        "publisher": {
+          "@type": "Organization",
+          "name": "YukiOS",
+          "url": "https://github.com/Reeyuki/YukiOS"
+        }
+      }
+    </script>
+    <link href="src/styles/achievements.css" rel="stylesheet" />
+    <link href="src/styles/converter.css" rel="stylesheet" />
+    <link href="src/styles/desktop.css" rel="stylesheet" />
+    <link href="src/styles/gamesAndApps.css" rel="stylesheet" />
+    <link href="src/styles/notification.css" rel="stylesheet" />
+    <link href="src/styles/session.css" rel="stylesheet" />
+    <link href="src/styles/settings.css" rel="stylesheet" />
+    <link href="src/styles/startMenu.css" rel="stylesheet" />
+    <link href="src/styles/steam.css" rel="stylesheet" />
+    <link href="src/styles/style.css" rel="stylesheet" />
+    <link href="src/styles/systemUI.css" rel="stylesheet" />
+    <link href="src/styles/taskbar.css" rel="stylesheet" />
+    <link href="src/styles/widgets.css" rel="stylesheet" />
+    <link href="src/styles/themes.css" rel="stylesheet" />
+    <link href="src/styles/cursorEffect.css" rel="stylesheet" />
+    <link href="src/styles/mobile.css" rel="stylesheet" />
+    <script type="module" src="src/main.js"></script>
+  </head>
+
+  <body>
+    <h1
+      style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap"
+    >
+      YukiOS - Free Browser-Based Desktop Environment
+    </h1>
+    <div id="selection-box"></div>
+
+    <div id="desktop" class="desktop" role="presentation">
+      <div id="start-menu" class="start-menu">
+        <div class="start-sidebar">
+          <div class="start-user">
+            <img src="static/icons/guest.webp" alt="User avatar" />
+            <span></span>
+          </div>
+
+          <div class="start-cat-list"></div>
+
+          <div class="start-cat" data-cat="settingsApp">Settings</div>
+
+          <div class="start-footer-actions">
+            <button class="start-sleep-btn" id="start-sleep-btn" title="Sleep">
+              <img
+                src="https://cdn.jsdelivr.net/gh/PapirusDevelopmentTeam/papirus-icon-theme@master/Papirus/22x22/apps/system-suspend.svg"
+                class="papirus-icon papirus-icon--32"
+                alt=""
+              />
+            </button>
+            <button class="start-lock-btn" id="start-lock-btn" title="Lock System">
+              <img
+                src="https://cdn.jsdelivr.net/gh/PapirusDevelopmentTeam/papirus-icon-theme@master/Papirus/22x22/actions/object-locked.svg"
+                class="papirus-icon papirus-icon--32"
+                alt=""
+              />
+            </button>
+            <button class="start-signout-btn" id="start-signout-btn" title="Sign Out">
+              <img
+                src="https://cdn.jsdelivr.net/gh/PapirusDevelopmentTeam/papirus-icon-theme@master/Papirus/22x22/actions/system-log-out.svg"
+                class="papirus-icon papirus-icon--32"
+                alt=""
+              />
+            </button>
+            <button class="start-shutdown-btn" id="start-shutdown-btn" title="Shutdown">
+              <img
+                src="https://cdn.jsdelivr.net/gh/PapirusDevelopmentTeam/papirus-icon-theme@master/Papirus/22x22/actions/system-shutdown.svg"
+                class="papirus-icon papirus-icon--32"
+                alt=""
+              />
+            </button>
+          </div>
+        </div>
+
+        <div class="start-content">
+          <div class="search-input-wrapper">
+            <img
+              src="https://cdn.jsdelivr.net/gh/PapirusDevelopmentTeam/papirus-icon-theme@master/Papirus/22x22/actions/edit-find.svg"
+              class="papirus-icon papirus-icon--22 search-icon"
+              alt=""
+            />
+            <input id="start-menu-search" placeholder="Search..." autocomplete="off" />
+          </div>
+
+          <div class="start-page active" data-page="all">
+            <div class="app-grid"></div>
+          </div>
+
+          <div class="start-page" data-page="favorites"></div>
+
+          <div class="start-page" data-page="recent"><div class="app-grid"></div></div>
+
+          <div class="start-page" data-page="development">
+            <div class="app-grid"></div>
+          </div>
+
+          <div class="start-page" data-page="games">
+            <div class="app-grid"></div>
+          </div>
+
+          <div class="start-page" data-page="graphics">
+            <div class="app-grid"></div>
+          </div>
+
+          <div class="start-page" data-page="help">
+            <div class="app-grid"></div>
+          </div>
+
+          <div class="start-page" data-page="internet">
+            <div class="app-grid"></div>
+          </div>
+
+          <div class="start-page" data-page="media">
+            <div class="app-grid"></div>
+          </div>
+
+          <div class="start-page" data-page="office">
+            <div class="app-grid"></div>
+          </div>
+
+          <div class="start-page" data-page="system">
+            <div class="app-grid"></div>
+          </div>
+
+          <div class="start-page" data-page="places">
+            <div class="places-section"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div id="taskbar">
+      <div id="mac-menu-bar">
+        <span class="mac-menu-item mac-menu-apple" data-start="true"
+          ><img
+            src="https://cdn.jsdelivr.net/gh/PapirusDevelopmentTeam/papirus-icon-theme@master/Papirus/22x22/apps/apple-music.svg"
+            class="papirus-icon papirus-icon--22"
+            alt=""
+        /></span>
+        <span class="mac-menu-item" data-menu="Finder">Finder</span>
+        <span class="mac-menu-item" data-menu="File">File</span>
+        <span class="mac-menu-item" data-menu="Edit">Edit</span>
+        <span class="mac-menu-item" data-menu="View">View</span>
+        <span class="mac-menu-item" data-menu="Go">Go</span>
+        <span class="mac-menu-item" data-menu="Window">Window</span>
+        <span class="mac-menu-item" data-menu="Help">Help</span>
+      </div>
+      <div id="start-button"></div>
+      <div id="taskbar-windows" style="display: flex"></div>
+      <div id="system-tray">
+        <div id="time-container">
+          <div id="clock">12:00 PM</div>
+          <div id="date">01/01/2026</div>
+        </div>
+        <div id="social-bar-container"></div>
+      </div>
+    </div>
+    <div id="context-menu"></div>
+  </body>
+</html>

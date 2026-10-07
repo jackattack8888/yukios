@@ -1,0 +1,42 @@
+export const LOGIN_TIPS = [
+  "The Shortcuts app rebinds any key and builds custom actions.",
+  "Press Ctrl+K for the command palette. Run apps, modes, and commands in keystrokes.",
+  "Press Ctrl+Alt+R for the Run dialog. Launch apps, URLs, and commands from one box.",
+  "Press Ctrl+D to show the desktop, and again to bring everything back.",
+  "Press Alt+Q to cycle windows.",
+  "Press Ctrl+Arrow keys to snap any window into halves or quarters.",
+  "Press Alt+Left-Click anywhere on a window to drag it. Alt+Right-Click resizes.",
+  "In tiling mode, Alt+Space toggles tiling and Alt+Arrows move focus between tiles.",
+  "Press Ctrl+Shift+S for a full screenshot, Ctrl+Alt+S for an area shot.",
+  "Press Alt+H to sample any pixel color with a magnified preview.",
+  "Right-click any file to convert formats entirely on your device.",
+  "Double-click an EXE file. BoxedWine runs Windows apps in your browser.",
+  "Disguise the tab as Google Classroom with Tab Cloak, then set a panic key.",
+  "Pin calendar, clipboard, mixer, and notification panels so clicks never close them.",
+  "One tab, six systems: pick macOS, Win7, ChromeOS, tiling, Deck, or 3D room at login.",
+  "The same desktop can look like Windows XP, Windows Vista, macOS, ChromeOS, or a tiling window manager.",
+  "Ask the local AI assistant to launch apps and manage files for you. (dont)",
+  "Eaglercraft plays Minecraft versions and mods from your desktop.",
+  "Weak machine? Performance mode trims effects and stretches battery.",
+  "Browse anonymously with the built-in Tor browser and Snowflake transport.",
+  "Windows 93 through Windows 11 can boot inside the virtual machine.",
+  "Download torrents with magnet links in the built-in torrent client.",
+  "Run python -m http.server in Terminal to serve your virtual files on localhost.",
+  "You can browse the YukiOS source code from inside YukiOS itself.",
+  "Right-click the Start button to pick a custom Start icon or upload your own.",
+  "Windows can wobble, shatter with Fall Apart, or wear XP and Vista headers.",
+  "Set any TTF or OTF as your system font from the font preview.",
+  "Type yuki in Terminal to control power, themes, wallpaper, and workspaces.",
+  "Type neofetch in Terminal for a full readout of your virtual machine.",
+  "The 3D room is a walkable world. Grab a game case and press F to launch it.",
+  {
+    text: "Did you know YukiOS has an early version?",
+    linkUrl: "https://reeyuki.github.io/YukiOS-AlphaHistorical/desktop/",
+    linkLabel: "Play the alpha"
+  },
+  "Press Shift+Tab in any game for playtime, friends, screenshots, and a built-in browser."
+];
+
+export function pickLoginTip() {
+  return LOGIN_TIPS[Math.floor(Math.random() * LOGIN_TIPS.length)];
+}

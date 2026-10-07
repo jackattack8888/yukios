@@ -1,0 +1,120 @@
+.transfer-dialog-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--bg-secondary) 55%, transparent);
+  backdrop-filter: blur(8px);
+}
+
+.transfer-dialog-box {
+  width: 300px;
+  max-width: calc(100vw - 48px);
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.65);
+  padding: 12px;
+}
+
+.window.transfer-dialog-window {
+  min-height: 0;
+}
+
+.transfer-dialog-root {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+}
+
+.transfer-dialog-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.transfer-dialog-count {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.transfer-dialog-progress {
+  width: 100%;
+  height: 6px;
+  appearance: none;
+  -webkit-appearance: none;
+  border: 1px solid var(--glass-border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--brand) 18%, transparent);
+  overflow: hidden;
+  color: var(--brand);
+}
+
+.transfer-dialog-progress::-webkit-progress-bar {
+  background: transparent;
+  border-radius: 8px;
+}
+
+.transfer-dialog-progress::-webkit-progress-value {
+  background: var(--brand);
+  border-radius: 8px;
+}
+
+.transfer-dialog-progress::-moz-progress-bar {
+  background: var(--brand);
+  border-radius: 8px;
+}
+
+.transfer-dialog-root.is-indeterminate .transfer-dialog-progress {
+  animation: transfer-dialog-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes transfer-dialog-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+.transfer-dialog-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.transfer-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.transfer-dialog-cancel {
+  padding: 6px 14px;
+  border: 1px solid var(--glass-border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 13px;
+  cursor: pointer;
+  transition:
+    border-color 0.15s,
+    color 0.15s;
+}
+
+.transfer-dialog-cancel:hover {
+  border-color: var(--brand);
+  color: var(--brand);
+}

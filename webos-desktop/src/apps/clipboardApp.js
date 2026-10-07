@@ -1,0 +1,442 @@
+import { $, createElement, setStyle, setText, setHTML } from "../shared/domUtils.js";
+import { BaseApp, StorageKeys, os, MODES } from "../framework.js";
+import { isTaskbarTop } from "../utils/utils.js";
+import { getTrayPosition } from "../tray/tray.js";
+import { setTrayPinState } from "../shared/trayPin.js";
+class ClipboardManagerApp extends BaseApp {
+  constructor(os) {
+    super(os);
+    this.clipboardManager = os.clipboardManager;
+    this.winId = "clipboard-manager-window";
+    this.popupId = "clipboard-tray-popup";
+    this.enabled = os.storage.get(StorageKeys.clipboardManagerEnabled) !== "false";
+    this.saveHistoryAcrossSessions = os.storage.get(StorageKeys.clipboardSaveHistory) !== "false";
+    this.historySize = os.storage.get(StorageKeys.clipboardHistorySize) || 50;
+    this.popupVisible = false;
+    this.pinned = false;
+    this.dialogOpen = false;
+    this.suppressOutsideClick = false;
+    this.initTray();
+    this.applySettings();
+    this.clipboardManager.onChange(() => this.updateTrayVisibility());
+    this.updateTrayVisibility();
+  }
+
+  updateTrayVisibility() {
+    if (!this.enabled || os.modes.isActive(MODES.MAC)) return;
+    const trayAppVisibility = os.storage.get(StorageKeys.trayAppVisibility) || {};
+    const hasItems = this.clipboardManager.getHistory().length > 0;
+    trayAppVisibility[this.winId] = hasItems;
+    os.storage.set(StorageKeys.trayAppVisibility, trayAppVisibility);
+    os.tray.updateItemVisibility(this.winId, hasItems);
+  }
+
+  shouldSuppressNotification() {
+    const position = os.storage.get(StorageKeys.notificationsPosition) || "bottom-right";
+    return position === "bottom-right";
+  }
+
+  initTray() {
+    if (os.modes.isActive(MODES.MAC)) return;
+    if (this.enabled) {
+      this.registerTray(this.winId, "fas fa-paste", "Clipboard", {
+        resident: true,
+        showInTray: true,
+        onClick: () => {
+          this.togglePopup();
+        }
+      });
+    }
+  }
+
+  applySettings() {
+    this.clipboardManager.setPersistenceEnabled(this.saveHistoryAcrossSessions);
+    this.clipboardManager.setMaxHistorySize(this.historySize);
+  }
+
+  saveSettings() {
+    os.storage.set(StorageKeys.clipboardSaveHistory, this.saveHistoryAcrossSessions.toString());
+    os.storage.set(StorageKeys.clipboardHistorySize, this.historySize.toString());
+  }
+
+  togglePopup() {
+    if (this.popupVisible) {
+      this.closePopup();
+    } else {
+      this.openPopup();
+    }
+  }
+
+  openPopup() {
+    if (this.popupVisible) return;
+
+    const existingPopup = $("#" + this.popupId);
+    if (existingPopup) {
+      existingPopup.remove();
+    }
+
+    const history = this.clipboardManager.getHistory();
+    const currentItem = this.clipboardManager.get();
+
+    const popup = createElement("div");
+    popup.id = this.popupId;
+    popup.className = "clipboard-tray-popup";
+    popup.innerHTML = `
+      <div class="clipboard-popup-header">
+        <span class="clipboard-popup-title">Clipboard History</span>
+        <button id="clear-clipboard" class="clipboard-clear-btn">
+          <i class="fas fa-trash"></i>
+        </button>
+        <button class="tray-pin-btn" title="Pin"><i class="fas fa-thumbtack"></i></button>
+      </div>
+      <div class="clipboard-settings-section">
+        <div class="clipboard-setting-row">
+          <div class="clipboard-setting-label">
+            <i class="fas fa-save"></i>
+            <span>Save history across sessions</span>
+          </div>
+          <label class="clipboard-toggle">
+            <input type="checkbox" id="save-history-toggle" ${this.saveHistoryAcrossSessions ? "checked" : ""}/>
+            <span class="clipboard-toggle-track"><span class="clipboard-toggle-thumb"></span></span>
+          </label>
+        </div>
+        <div class="clipboard-setting-row">
+          <div class="clipboard-setting-label">
+            <i class="fas fa-list-ol"></i>
+            <span>History size</span>
+          </div>
+          <div class="clipboard-history-size-input">
+            <input type="number" id="history-size-input" min="5" max="100" value="${this.historySize}" />
+            <span class="clipboard-history-size-label">items</span>
+          </div>
+        </div>
+      </div>
+      <div id="clipboard-history" class="clipboard-history-list">
+        ${history.length === 0 ? '<div class="clipboard-empty">No clipboard history</div>' : ""}
+      </div>
+    `;
+
+    document.body.appendChild(popup);
+
+    const pos = getTrayPosition();
+    popup.style.left = pos.left;
+    popup.style.right = pos.right;
+    popup.style.top = pos.top;
+    popup.style.bottom = pos.bottom;
+    popup.style.display = "block";
+
+    this.popupVisible = true;
+    this.suppressOutsideClick = true;
+    this.renderHistory(popup, history, currentItem);
+    this.bindEvents(popup, this.popupId);
+
+    document.addEventListener("click", this.handleOutsideClick);
+  }
+
+  closePopup() {
+    const popup = $("#" + this.popupId);
+    if (popup) {
+      popup.classList.add("closing");
+      popup.addEventListener(
+        "animationend",
+        () => {
+          popup.remove();
+        },
+        { once: true }
+      );
+    }
+    this.popupVisible = false;
+    document.removeEventListener("click", this.handleOutsideClick);
+  }
+
+  handleOutsideClick = (e) => {
+    if (this.pinned) return;
+    if (this.dialogOpen) return;
+    if (this.suppressOutsideClick) {
+      this.suppressOutsideClick = false;
+      return;
+    }
+    const popup = $("#" + this.popupId);
+    const trayEl = $("#app-tray");
+    if (popup && !e.target.closest("#clipboard-tray-popup") && !e.target.closest("#app-tray")) {
+      this.closePopup();
+    }
+  };
+
+  open(options = {}) {
+    this.togglePopup();
+  }
+
+  renderHistory(popup, history, currentItem) {
+    const container = popup.querySelector("#clipboard-history");
+    if (!container) return;
+
+    if (history.length === 0) {
+      container.innerHTML = '<div class="clipboard-empty">No clipboard history</div>';
+      return;
+    }
+
+    container.innerHTML = history
+      .map((item, index) => {
+        const preview = this.getPreview(item);
+        const timestamp = new Date(item.timestamp).toLocaleTimeString();
+        const isStarred = this.clipboardManager.isStarred(item.id);
+
+        return `
+        <div class="clipboard-item" data-index="${index}">
+          <div class="clipboard-item-meta">
+            <i class="fas ${this.getTypeIcon(item.type)}"></i>
+            <span class="clipboard-item-time">${timestamp}</span>
+            <span class="clipboard-item-type">${item.type}</span>
+          </div>
+          <div class="clipboard-item-content">
+            ${preview}
+          </div>
+          <div class="clipboard-item-actions">
+            <button class="clipboard-action-btn edit-btn" data-index="${index}" title="Edit contents">
+              <i class="fas fa-pen"></i>
+            </button>
+            <button class="clipboard-action-btn star-btn ${isStarred ? "starred" : ""}" data-index="${index}" title="${isStarred ? "Unstar" : "Star"}">
+              <i class="fas fa-star"></i>
+            </button>
+            <button class="clipboard-action-btn remove-btn" data-index="${index}" title="Remove from history">
+              <i class="fas fa-trash"></i>
+            </button>
+          </div>
+        </div>
+      `;
+      })
+      .join("");
+
+    const currentPopup = $("#" + this.popupId);
+    container.querySelectorAll(".clipboard-item").forEach((el) => {
+      el.addEventListener("click", async (e) => {
+        if (e.target.closest(".clipboard-action-btn")) return;
+
+        const index = parseInt(el.dataset.index);
+        const item = history[index];
+        if (item) {
+          this.isCopyingFromHistory = true;
+
+          const rect = el.getBoundingClientRect();
+          const originalBorder = el.style.borderColor;
+          const originalBackground = el.style.background;
+          const originalBoxShadow = el.style.boxShadow;
+
+          setStyle(el, {
+            background: "var(--brand-dim)",
+            borderColor: "var(--brand)",
+            boxShadow: "0 0 30px var(--brand-glow)",
+            transition: "all 0.3s ease"
+          });
+
+          const copiedIndicator = createElement("div");
+          copiedIndicator.className = "clipboard-copied-indicator";
+          copiedIndicator.textContent = "Copied!";
+          setStyle(copiedIndicator, {
+            position: "fixed",
+            top: `${rect.top + rect.height / 2}px`,
+            left: `${rect.left + rect.width / 2}px`,
+            transform: "translate(-50%,-50%)",
+            background: "var(--brand)",
+            color: "var(--text-on-brand)",
+            fontSize: "13px",
+            padding: "6px 16px",
+            borderRadius: "6px",
+            fontWeight: "600",
+            pointerEvents: "none",
+            zIndex: "10000",
+            boxShadow: "0 4px 12px var(--brand-glow)",
+            transition: "opacity 0.3s ease"
+          });
+          document.body.appendChild(copiedIndicator);
+
+          try {
+            await navigator.clipboard.writeText(String(item.data));
+          } catch (e) {
+            console.error("[ClipboardApp] Failed to copy to browser clipboard:", e);
+            copiedIndicator.textContent = "Failed";
+            setStyle(copiedIndicator, { background: "var(--error)" });
+          }
+
+          setTimeout(() => {
+            setStyle(copiedIndicator, { opacity: "0" });
+          }, 1500);
+
+          setTimeout(() => {
+            setStyle(el, {
+              background: originalBackground,
+              borderColor: originalBorder,
+              boxShadow: originalBoxShadow
+            });
+            copiedIndicator.remove();
+            this.isCopyingFromHistory = false;
+          }, 1800);
+        }
+      });
+    });
+
+    container.querySelectorAll(".edit-btn").forEach((btn) => {
+      btn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const index = parseInt(btn.dataset.index);
+        const item = history[index];
+        if (item) {
+          this.dialogOpen = true;
+          const newData = await os.dialog.prompt(
+            "Edit Clipboard Contents",
+            "Edit clipboard contents:",
+            String(item.data),
+            "Save"
+          );
+          this.dialogOpen = false;
+          if (newData !== null && newData !== item.data) {
+            this.clipboardManager.updateItem(index, newData);
+            this.renderHistory(currentPopup, this.clipboardManager.getHistory(), this.clipboardManager.get());
+          }
+        }
+      });
+    });
+
+    container.querySelectorAll(".remove-btn").forEach((btn) => {
+      btn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const index = parseInt(btn.dataset.index);
+        this.clipboardManager.removeFromHistory(index);
+        this.renderHistory(currentPopup, this.clipboardManager.getHistory(), this.clipboardManager.get());
+      });
+    });
+
+    container.querySelectorAll(".star-btn").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const index = parseInt(btn.dataset.index);
+        const item = history[index];
+        if (item) {
+          this.clipboardManager.toggleStar(item.id);
+          this.renderHistory(currentPopup, this.clipboardManager.getHistory(), this.clipboardManager.get());
+        }
+      });
+    });
+  }
+
+  getPreview(item) {
+    if (item.type === "text") {
+      return item.data.length > 100 ? item.data.substring(0, 100) + "..." : item.data;
+    } else if (item.type === "json") {
+      try {
+        const str = JSON.stringify(item.data);
+        return str.length > 100 ? str.substring(0, 100) + "..." : str;
+      } catch {
+        return "[Invalid JSON]";
+      }
+    } else if (item.type === "image") {
+      return "[Image data]";
+    }
+    return String(item.data);
+  }
+
+  getTypeIcon(type) {
+    switch (type) {
+      case "text":
+        return "fa-font";
+      case "json":
+        return "fa-code";
+      case "image":
+        return "fa-image";
+      default:
+        return "fa-file";
+    }
+  }
+
+  bindEvents(popup, popupId) {
+    const clearBtn = popup.querySelector("#clear-clipboard");
+    const pinBtn = popup.querySelector(".tray-pin-btn");
+    const saveHistoryToggle = popup.querySelector("#save-history-toggle");
+    const historySizeInput = popup.querySelector("#history-size-input");
+
+    if (clearBtn) {
+      clearBtn.addEventListener("click", () => {
+        this.clipboardManager.clear();
+        this.renderHistory(popup, this.clipboardManager.getHistory(), this.clipboardManager.get());
+      });
+    }
+
+    if (pinBtn) {
+      setTrayPinState(popup, pinBtn, this.pinned);
+      pinBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this.pinned = !this.pinned;
+        setTrayPinState(popup, pinBtn, this.pinned);
+      });
+    }
+
+    if (saveHistoryToggle) {
+      saveHistoryToggle.addEventListener("change", (e) => {
+        this.saveHistoryAcrossSessions = e.target.checked;
+        this.applySettings();
+        this.saveSettings();
+        if (!this.shouldSuppressNotification()) {
+          os.notify.send(
+            "Settings Updated",
+            this.saveHistoryAcrossSessions
+              ? "History will be saved across sessions"
+              : "History will not be saved across sessions",
+            "info",
+            2000,
+            "fa-save"
+          );
+        }
+      });
+    }
+
+    if (historySizeInput) {
+      historySizeInput.addEventListener("change", (e) => {
+        const newSize = parseInt(e.target.value);
+        if (newSize >= 5 && newSize <= 100) {
+          this.historySize = newSize;
+          this.applySettings();
+          this.saveSettings();
+          if (!this.shouldSuppressNotification()) {
+            os.notify.send(
+              "Settings Updated",
+              `History size set to ${this.historySize} items`,
+              "info",
+              2000,
+              "fa-list-ol"
+            );
+          }
+        } else {
+          historySizeInput.value = this.historySize;
+          if (!this.shouldSuppressNotification()) {
+            os.notify.send(
+              "Invalid Value",
+              "History size must be between 5 and 100",
+              "error",
+              2000,
+              "fa-exclamation-triangle"
+            );
+          }
+        }
+      });
+    }
+
+    this.clipboardManager.onChange((item) => {
+      if (this.isCopyingFromHistory) return;
+      const currentPopup = $("#" + this.popupId);
+      if (currentPopup) {
+        this.renderHistory(currentPopup, this.clipboardManager.getHistory(), this.clipboardManager.get());
+      }
+    });
+  }
+
+  onClose(winId) {
+    this.closePopup();
+    this.untrackWindow(winId);
+    if (!this.enabled) {
+      this.unregisterTray(winId);
+    }
+  }
+}
+
+export { ClipboardManagerApp };

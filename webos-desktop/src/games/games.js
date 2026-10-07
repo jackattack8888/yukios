@@ -1,0 +1,742 @@
+import { appMap } from "./gamesList.js";
+import { descriptionMap } from "./gameDescriptions.js";
+import { GameRenderer } from "./GameRenderer.js";
+import { GameLauncher } from "./GameLauncher.js";
+import { GameUI } from "./GameUI.js";
+import { LargeModeAudio } from "./steamAudio.js";
+import { resolveGhUrl, resolveIconUrl } from "../shared/assetResolver.js";
+import { resolveAvatarUrl } from "../social/avatarResolver.js";
+import { CDN_CONFIG } from "../shared/cdnConfig.js";
+import { getAppRegistry } from "../appRegistry.js";
+import { getCurrentUser } from "../desktopui/startMenu.js";
+import { $, $$, setText } from "../shared/domUtils.js";
+import { STEAM_NEWS_ITEMS } from "./steamNewsData.js";
+import { fetchSocialMe } from "../social/socialMeApi.js";
+import { offerSteamTour } from "../apps/steamIntro.js";
+import { StorageKeys, os, MODES } from "../framework.js";
+import { openSteamSettingsWindow } from "./steamSettings.js";
+import { BusEvents } from "../core/EventBus.js";
+import { launchSplash } from "../modes/steamdeck/launchSplash.js";
+import { SteamSettings } from "./steamSettings.js";
+import { applySteamDeckSettings } from "../modes/steamdeck/session.js";
+
+export function getCdnBase() {
+  return CDN_CONFIG.repos.main.base;
+}
+
+function switchToSteamDeckMode() {
+  applySteamDeckSettings();
+}
+
+export function getCdnBaseGames() {
+  return CDN_CONFIG.repos.games.base;
+}
+
+export let launcher = null;
+export let desktopUI = null;
+
+export const steamAudio = new LargeModeAudio();
+
+export function setGameLauncher(appLauncher) {
+  launcher = appLauncher;
+}
+
+export function setDesktopUI(ui) {
+  desktopUI = ui;
+}
+
+export function refreshSteamUI() {
+  const user = getCurrentUser();
+  const username = user.name;
+  const profilePic = user.avatar;
+
+  const steamUserProfiles = $$(".steam-profile-name");
+  steamUserProfiles.forEach((span) => {
+    if (span && span.textContent !== username) {
+      span.textContent = username;
+    }
+  });
+
+  const userTab = $('.steam-tab[data-page="user"]');
+  if (userTab && userTab.textContent !== username) {
+    userTab.textContent = username;
+  }
+
+  const friendsName = $(".friends-name");
+  if (friendsName && friendsName.textContent !== username) {
+    friendsName.textContent = username;
+  }
+
+  const steamProfileImgs = $$(".steam-user-profile img");
+  const friendsProfileImg = $(".friends-profile img");
+  const avatarImgs = [...steamProfileImgs];
+  if (friendsProfileImg instanceof HTMLImageElement) avatarImgs.push(friendsProfileImg);
+  if (avatarImgs.length > 0) {
+    resolveAvatarUrl(profilePic, "static/icons/guest.webp").then((url) => {
+      avatarImgs.forEach((img) => {
+        if (img instanceof HTMLImageElement && img.src !== url) img.src = url;
+      });
+    });
+  }
+
+  updateSteamProfileCoins();
+}
+
+export async function updateSteamProfileCoins() {
+  const coinsEl = $(".steam-profile-coins");
+  const streakEl = $(".steam-profile-streak");
+  if (!coinsEl && !streakEl) return;
+  const me = await fetchSocialMe().catch(() => null);
+  const coins = me && typeof me.coins === "number" ? me.coins : null;
+  const valueEl = $(".steam-profile-coins-value", coinsEl);
+  if (coins == null) {
+    if (coinsEl) coinsEl.classList.add("steam-profile-coins--hidden");
+  } else {
+    if (valueEl) setText(valueEl, String(coins));
+    coinsEl.classList.remove("steam-profile-coins--hidden");
+  }
+  const streakVal = me && typeof me.streak === "number" && me.streak > 0 ? me.streak : null;
+  const valueStreakEl = $(".steam-profile-streak-value", streakEl);
+  if (streakVal == null) {
+    if (streakEl) streakEl.classList.add("steam-profile-streak--hidden");
+  } else {
+    if (valueStreakEl) setText(valueStreakEl, String(streakVal));
+    streakEl.classList.remove("steam-profile-streak--hidden");
+  }
+}
+
+const imgObserver = new IntersectionObserver(
+  (entries) => {
+    entries.forEach((entry) => {
+      if (!entry.isIntersecting) return;
+      const img = entry.target;
+      if (img.dataset.src) {
+        img.src = img.dataset.src;
+        delete img.dataset.src;
+      }
+      imgObserver.unobserve(img);
+    });
+  },
+  { rootMargin: "200px" }
+);
+
+export function lazyImg(src, attrs = "") {
+  return `<img data-src="${src}" ${attrs}/>`;
+}
+
+export function observeLazyImages(root) {
+  root.querySelectorAll("img[data-src]").forEach((img) => imgObserver.observe(img));
+}
+
+function patchAppMap(appMap) {
+  for (const key in appMap) {
+    const app = appMap[key];
+
+    if (app.icon && app.icon.startsWith("/static/")) {
+      if (key.startsWith("subwaySurfers")) {
+        app.icon = resolveGhUrl(
+          `https://cdn.jsdelivr.net/gh/NaoTomori1/yukios-games@main/subwaySurfers/${app.icon.split("/").pop()}`
+        );
+      } else {
+        app.icon = `${getCdnBase()}${app.icon}`;
+      }
+    }
+    if (app.swf && app.swf.startsWith("/static/games/")) {
+      app.swf = getCdnBaseGames() + app.swf.replace("/static/games/", "/");
+    }
+    if (app.url && app.url.startsWith("/static/games/")) {
+      app.url = getCdnBaseGames() + app.url.replace("/static/games/", "/");
+    }
+  }
+
+  return appMap;
+}
+patchAppMap(appMap);
+
+export const popularityMap = new Map(Object.keys(appMap).map((id, index) => [id, index]));
+
+export function getGameName(appId) {
+  return appMap[appId]?.title || null;
+}
+
+const GAMES_APP_EXCLUDED = new Set(["TMNP", "vscode", "paint", "photopea"]);
+
+export const HIGHLIGHTED_GAMES = new Set([
+  "tabs",
+  "lobotomyCorporation",
+  "slimeRancher",
+  "plagueIncEvolved",
+  "pttr",
+  "helltaker",
+  "passpartout",
+  "inStarsAndTime",
+  "inscryption",
+  "nightInTheWoods",
+  "daddy",
+  "yt",
+  "ytlifeomg",
+  "suicideGuy",
+  "antidisestablishmentarianism",
+  "theMathIsLeaking",
+  "minusThree",
+  "three",
+  "fiveNightsAtFrickbears3",
+  "baldisBasicsTeachingOnTwos",
+  "playtimeHellBear5van",
+  "baldiBalds",
+  "pneumo",
+  "wheresBaldi"
+]);
+
+const FLASH_EMUPEDIA_EXCLUDED = new Set([
+  "doom",
+  "doom2",
+  "vscode",
+  "geometryDash",
+  "game2048",
+  "mario",
+  "fruitNinja",
+  "cutTheRope",
+  "jetpack"
+]);
+const FLASH_EMUPEDIA_PATTERN = "emupedia.net";
+const FLASH_URL_PATTERNS = [
+  "papasgamesfree.io",
+  "flashpointarchive.html",
+  "/static/rfiv.html",
+  "cache.armorgames.com",
+  "silvergames.com"
+];
+
+const FLASH_LOCAL_IDS = new Set(["badIceCream", "henry", "badIceCream2", "badIceCream3", "trinitas"]);
+
+function isFlashGame(id, data) {
+  if (data.type === "swf") return true;
+  if (data.swf) return true;
+  if (FLASH_LOCAL_IDS.has(id)) return true;
+  if (data.type !== "game") return false;
+  const url = data.url || "";
+  if (FLASH_URL_PATTERNS.some((p) => url.includes(p))) return true;
+  if (url.includes(FLASH_EMUPEDIA_PATTERN) && !FLASH_EMUPEDIA_EXCLUDED.has(id)) return true;
+  return false;
+}
+
+export const SteamDataManager = {
+  cache: {},
+
+  invalidateCache() {
+    this.cache = {};
+  },
+
+  getStats() {
+    if (this.cache.stats === undefined) this.cache.stats = os.storage.get(StorageKeys.steamStats) || {};
+    return this.cache.stats;
+  },
+
+  getRecentGames() {
+    try {
+      if (this.cache.recentGames === undefined) {
+        const stored = os.storage.get(StorageKeys.steamRecentGames);
+        this.cache.recentGames = stored || [];
+      }
+      return this.cache.recentGames;
+    } catch (e) {
+      return [];
+    }
+  },
+
+  getRecentMinutes(appId) {
+    const TWO_WEEKS_MS = 14 * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    try {
+      if (this.cache.sessions === undefined) this.cache.sessions = os.storage.get(StorageKeys.steamSessions) || {};
+      const appSessions = this.cache.sessions[appId] || [];
+      return appSessions.filter((s) => now - s.ts < TWO_WEEKS_MS).reduce((sum, s) => sum + s.min, 0);
+    } catch {
+      return 0;
+    }
+  },
+  getFavorites: () => os.storage.get(StorageKeys.steamFavorites) || [],
+  setFavorites: (favs) => os.storage.set(StorageKeys.steamFavorites, favs),
+  getCollections: () => os.storage.get(StorageKeys.steamCollections) || {},
+  setCollections: (cols) => os.storage.set(StorageKeys.steamCollections, cols),
+  getHidden: () => os.storage.get(StorageKeys.steamHidden) || [],
+  setHidden: (hidden) => os.storage.set(StorageKeys.steamHidden, hidden),
+  getCollapsed: () => {
+    const stored = os.storage.get(StorageKeys.steamCollapsed);
+    if (stored === null) {
+      const defaultExpanded = ["Webports/Html games"];
+      os.storage.set(StorageKeys.steamCollapsed, defaultExpanded);
+      return defaultExpanded;
+    }
+    return stored || [];
+  },
+  setCollapsed: (collapsed) => os.storage.set(StorageKeys.steamCollapsed, collapsed),
+
+  setupDefaultCollections: () => {
+    const cols = SteamDataManager.getCollections();
+    if (cols["Webports/Html games"] && cols["Flash Games"]) return;
+    const allEntries = Object.entries(appMap).filter(
+      ([id, data]) => data.type !== "system" && !GAMES_APP_EXCLUDED.has(id) && data.icon && data.title
+    );
+
+    const flashIds = allEntries.filter(([id, data]) => isFlashGame(id, data)).map(([id]) => id);
+    const webIds = allEntries.filter(([id, data]) => !isFlashGame(id, data)).map(([id]) => id);
+
+    cols["Webports/Html games"] = webIds;
+    cols["Flash Games"] = flashIds;
+    SteamDataManager.setCollections(cols);
+  },
+
+  toggleFavorite: (appId) => {
+    const favs = SteamDataManager.getFavorites();
+    const index = favs.indexOf(appId);
+    if (index === -1) favs.push(appId);
+    else favs.splice(index, 1);
+    SteamDataManager.setFavorites(favs);
+    return index === -1;
+  },
+  toggleHide: (appId) => {
+    const hidden = SteamDataManager.getHidden();
+    const index = hidden.indexOf(appId);
+    if (index === -1) hidden.push(appId);
+    else hidden.splice(index, 1);
+    SteamDataManager.setHidden(hidden);
+    return index === -1;
+  },
+  toggleCollapsed: (name) => {
+    const collapsed = SteamDataManager.getCollapsed();
+    const index = collapsed.indexOf(name);
+    if (index === -1) collapsed.push(name);
+    else collapsed.splice(index, 1);
+    SteamDataManager.setCollapsed(collapsed);
+    return index === -1;
+  },
+  addToCollection: (name, appId) => {
+    const cols = SteamDataManager.getCollections();
+    if (!cols[name]) cols[name] = [];
+    if (!cols[name].includes(appId)) {
+      cols[name].push(appId);
+      SteamDataManager.setCollections(cols);
+    }
+  },
+  createCollection: (name) => {
+    const cols = SteamDataManager.getCollections();
+    if (!cols[name]) {
+      cols[name] = [];
+      SteamDataManager.setCollections(cols);
+    }
+  },
+  isFavorite: (appId) => SteamDataManager.getFavorites().includes(appId),
+  addCurrentToCollection: async (appId) => {
+    const cols = SteamDataManager.getCollections();
+    const names = Object.keys(cols);
+    if (names.length === 0) {
+      const name = await os.dialog.prompt("New Collection", "Enter collection name:");
+      if (name && name.trim()) {
+        const clean = name.trim();
+        SteamDataManager.createCollection(clean);
+        SteamDataManager.addToCollection(clean, appId);
+      }
+      return;
+    }
+    const suggestion = names[0];
+    const name = await os.dialog.prompt(
+      "Save to Collection",
+      `Enter collection name (existing: ${names.join(", ")}):`,
+      suggestion
+    );
+    if (!name || !name.trim()) return;
+    const clean = name.trim();
+    if (!cols[clean]) SteamDataManager.createCollection(clean);
+    SteamDataManager.addToCollection(clean, appId);
+  },
+  getRecentGames: () => {
+    try {
+      const stored = os.storage.get(StorageKeys.steamRecentGames);
+      return stored || [];
+    } catch (e) {
+      return [];
+    }
+  },
+  setRecentGames: (games) => {
+    try {
+      os.storage.set(StorageKeys.steamRecentGames, games);
+      SteamDataManager.invalidateCache();
+    } catch (e) {
+      console.warn("Failed to save recent games:", e);
+    }
+  },
+  addRecentGame: (gameId, gameTitle) => {
+    const recentGames = SteamDataManager.getRecentGames();
+    const existingIndex = recentGames.findIndex((g) => g.id === gameId);
+    if (existingIndex !== -1) {
+      recentGames.splice(existingIndex, 1);
+    }
+    recentGames.unshift({ id: gameId, title: gameTitle, timestamp: Date.now() });
+    const trimmed = recentGames.slice(0, 10);
+    SteamDataManager.setRecentGames(trimmed);
+    return trimmed;
+  },
+  removeRecentGame: (gameId) => {
+    const recentGames = SteamDataManager.getRecentGames();
+    const next = recentGames.filter((g) => g.id !== gameId);
+    SteamDataManager.setRecentGames(next);
+    return next;
+  },
+  getSteamContextMenuItems: (appLauncher, wm, gameUI) => {
+    const recentGames = SteamDataManager.getRecentGames();
+    const items = [
+      { label: "Library", icon: "fa-book", action: null },
+      { label: "Store", icon: "fa-store", action: null },
+      { label: "Community", icon: "fa-users", action: () => dispatchSteamNavigate("community") },
+      { type: "divider" },
+      { label: "Friends", icon: "fa-user-group", action: () => gameUI.openFriendsWindow(wm) },
+      { label: "Settings", icon: "fa-gear", action: () => openSteamSettingsWindow(wm) },
+      { type: "divider" },
+      { label: "Steam Deck Mode", icon: "fa-gamepad", action: () => switchToSteamDeckMode() },
+      { type: "divider" }
+    ];
+
+    if (recentGames.length > 0) {
+      items.push({ label: "Recent Games", icon: "fa-clock", action: null });
+      recentGames.forEach((game) => {
+        items.push({
+          label: game.title,
+          icon: "fa-gamepad",
+          action: () => {
+            if (appLauncher) appLauncher.launch(game.id);
+          }
+        });
+      });
+      items.push({ type: "divider" });
+    }
+
+    return items;
+  }
+};
+
+export function initSteamDataManagerCache() {
+  const subscribeKeys = [StorageKeys.steamStats, StorageKeys.steamRecentGames, StorageKeys.steamSessions];
+  subscribeKeys.forEach((key) => os.storage.subscribe(key, () => SteamDataManager.invalidateCache()));
+}
+
+const STEAM_WIN_ID = "games-app-win";
+
+const dispatchSteamNavigate = (page, navData = {}) => {
+  const container = $("#games-app-container");
+  if (!container) return;
+  container.dispatchEvent(new CustomEvent("steam-navigate", { detail: { page, ...navData } }));
+};
+
+export function openSteamWindow(appLauncher, wm, focusCollection = null, gameId = null, page = null, navData = {}) {
+  const existing = $("#" + STEAM_WIN_ID);
+  if (existing) {
+    if (existing.style.display === "none") {
+      os.tray.restoreFromTray(STEAM_WIN_ID);
+    } else {
+      existing.style.display = "flex";
+      wm.bringToFront(existing);
+    }
+    const taskbarItem = $(`#taskbar-${STEAM_WIN_ID}`);
+    if (taskbarItem) {
+      taskbarItem.style.display = "";
+      taskbarItem.classList.remove("minimized");
+    }
+
+    if (page) {
+      setTimeout(() => dispatchSteamNavigate(page, navData), 50);
+      return;
+    }
+
+    if (gameId) {
+      const container = existing.querySelector("#games-app-container");
+      const onLaunch = (appId) => {
+        if (appLauncher) os.app.launch(appId);
+      };
+
+      if (container.classList.contains("steam-app-root")) {
+        const gamesRenderer = new SteamAppRenderer();
+        gamesRenderer.renderGameOverview(container, gameId, onLaunch);
+      } else {
+        const gamesRenderer = new SteamAppRenderer();
+        gamesRenderer.render(container, onLaunch, wm, focusCollection);
+        setTimeout(() => {
+          gamesRenderer.renderGameOverview(container, gameId, onLaunch);
+        }, 100);
+      }
+    }
+    return;
+  }
+
+  const winTitle = "Games";
+  const taskbarIcon = focusCollection === "Flash Games" ? resolveIconUrl("static/icons/flash.webp") : "fab fa-steam";
+
+  const win = os.window.create(STEAM_WIN_ID, winTitle, "90%", "90%", {
+    icon: taskbarIcon,
+    position: { x: "5%", y: "5%" },
+    skipHeader: true
+  });
+  win.classList.add("window-root");
+  win.style.display = "flex";
+  win.style.flexDirection = "column";
+
+  const gamesRenderer = new SteamAppRenderer();
+
+  win.innerHTML = `
+    <div class="window-content games-app-window" style="flex:1;overflow:auto;padding:0;box-sizing:border-box;">
+      <div id="games-app-container" style="height:100%;"></div>
+    </div>`;
+
+  if (!os.modes.isActive(MODES.MAC)) {
+    os.tray.register(STEAM_WIN_ID, taskbarIcon, winTitle, {
+      showInTray: true,
+      contextMenuItems: SteamDataManager.getSteamContextMenuItems(appLauncher, wm, gamesRenderer),
+      priority: 100
+    });
+  }
+
+  const container = win.querySelector("#games-app-container");
+  const onLaunch = (appId) => {
+    if (appLauncher) {
+      const game = appLauncher.appMap?.[appId];
+      if (game) {
+        SteamDataManager.addRecentGame(appId, game.title);
+      }
+      os.app.launch(appId);
+    }
+  };
+
+  const setupSteamControls = () => {
+    const closeBtn = win.querySelector(".close-btn");
+    if (closeBtn) {
+      closeBtn.onclick = () => {
+        os.tray.sendToTray(STEAM_WIN_ID);
+      };
+    }
+  };
+
+  const gameParam = new URLSearchParams(window.location.search).get("steam") || gameId;
+  if (gameParam) {
+    if (gameId && !new URLSearchParams(window.location.search).get("steam")) {
+      gamesRenderer.render(container, onLaunch, wm, focusCollection);
+      setupSteamControls();
+      setTimeout(() => {
+        gamesRenderer.renderGameOverview(container, gameId, onLaunch);
+      }, 100);
+    } else {
+      handleGameUrlParam(gamesRenderer, container, onLaunch, wm);
+      setupSteamControls();
+    }
+  } else {
+    gamesRenderer.render(container, onLaunch, wm, focusCollection);
+    setupSteamControls();
+  }
+
+  if (page) {
+    setTimeout(() => dispatchSteamNavigate(page, navData), 900);
+  } else if (!gameId) {
+    setTimeout(() => offerSteamTour(), 1200);
+  }
+}
+
+export function handleSteamUrlParam(appLauncher, wm) {
+  const gameParam = new URLSearchParams(window.location.search).get("steam");
+  if (!gameParam) return false;
+  const run = () => openSteamWindow(appLauncher, wm);
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", run);
+  } else {
+    run();
+  }
+  return true;
+}
+
+class GameWindowRenderer {
+  constructor() {
+    this.history = ["store"];
+    this.historyIndex = 0;
+    this.sortBy = "relevant";
+    this.sortReverse = false;
+    this.currentGame = null;
+    this.currentArchiveGame = null;
+    this.archiveGamesCache = [];
+    this.hasRendered = false;
+    this.ctrlFBound = false;
+    this.profileUserId = null;
+    this.newsItems =
+      STEAM_NEWS_ITEMS.length > 0
+        ? STEAM_NEWS_ITEMS.flat()
+        : [{ image: "fas fa-snowflake", title: "Yuki Steam App Added", date: "May 1, 2026" }];
+    this.imgObserver = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          if (!entry.isIntersecting) return;
+          const img = entry.target;
+          if (img.dataset.src) {
+            img.src = img.dataset.src;
+            delete img.dataset.src;
+          }
+          this.imgObserver.unobserve(img);
+        });
+      },
+      { rootMargin: "200px" }
+    );
+
+    this.gameRenderer = new GameRenderer(this);
+    this.gameLauncher = new GameLauncher(this);
+    this.gameUI = new GameUI(this);
+  }
+
+  getGames() {
+    return [];
+  }
+
+  getGameDescription(appId) {
+    if (descriptionMap[appId]) {
+      return descriptionMap[appId];
+    }
+    const title = appMap[appId]?.title || appId;
+    return `Experience ${title} on YukiOS. This game is part of your Yuki Steam library.`;
+  }
+
+  setCurrentGame(appId) {
+    this.currentGame = appId;
+    this.currentArchiveGame = null;
+  }
+
+  showGameOverlay(title, url) {
+    return this.gameLauncher.showGameOverlay(title, url);
+  }
+
+  renderGameOverview(container, appId, onLaunch) {
+    return this.gameRenderer.renderGameOverview(container, appId, onLaunch);
+  }
+
+  renderArchiveGameOverview(container, archiveGame, onLaunch) {
+    return this.gameRenderer.renderArchiveGameOverview(container, archiveGame, onLaunch);
+  }
+
+  renderGrid(container, onLaunch, focusCollection = null) {
+    return this.gameRenderer.renderGrid(container, onLaunch, focusCollection);
+  }
+
+  render(container, onLaunch, wm = null, focusCollection = null) {
+    return this.gameUI.render(container, onLaunch, wm, focusCollection);
+  }
+
+  openFriendsWindow(wm) {
+    return this.gameUI.openFriendsWindow(wm);
+  }
+
+  setActiveSidebarItem(container, appId) {
+    return this.gameUI.setActiveSidebarItem(container, appId);
+  }
+
+  makeSidebarItem(game, container, onLaunch, isArchive = false) {
+    return this.gameUI.makeSidebarItem(game, container, onLaunch, isArchive);
+  }
+
+  appendArchiveGameToSidebar(container, archiveGame, onLaunch) {
+    const sidebarList = container.querySelector(".sidebar-game-list");
+    if (!sidebarList) return;
+
+    const existing = sidebarList.querySelector(`.sidebar-game-item[data-app="${archiveGame.appId}"]`);
+    if (existing) return;
+
+    const item = this.makeSidebarItem(archiveGame, container, onLaunch, true);
+    item.classList.add("sidebar-archive-item");
+    sidebarList.appendChild(item);
+    observeLazyImages(item);
+  }
+
+  async loadArchiveSection(container, onLaunch, collapsed) {
+    const launcher = new GameLauncher(this);
+    return launcher.loadArchiveSection(container, onLaunch, collapsed);
+  }
+
+  async loadLuminSDKSection(container, collapsed) {
+    const launcher = new GameLauncher(this);
+    return launcher.loadLuminSDKSection(container, collapsed);
+  }
+
+  attachGridDelegation(container, onLaunch) {
+    return this.gameUI.attachGridDelegation(container, onLaunch);
+  }
+
+  showContextMenu(e, appId, container, onLaunch) {
+    return this.gameUI.showContextMenu(e, appId, container, onLaunch);
+  }
+
+  rebuildSidebar(container, onLaunch) {
+    return this.gameUI.rebuildSidebar(container, onLaunch);
+  }
+
+  renderSidebarChunked(container, games, onLaunch) {
+    return this.gameUI.renderSidebarChunked(container, games, onLaunch);
+  }
+
+  renderHiddenSidebar(container, hiddenGames, onLaunch) {
+    return this.gameUI.renderHiddenSidebar(container, hiddenGames, onLaunch);
+  }
+
+  initSidebarDrag(container) {
+    return this.gameUI.initSidebarDrag(container);
+  }
+}
+
+export class SteamAppRenderer extends GameWindowRenderer {
+  getGames() {
+    if (this.gamesCache) return this.gamesCache;
+    const appRegistry = getAppRegistry();
+    this.gamesCache = Object.entries(appMap)
+      .filter(([id, data]) => {
+        if (data.type === "system") return false;
+        if (GAMES_APP_EXCLUDED.has(id)) return false;
+        if (!data.icon || !data.title) return false;
+        if (appRegistry.isAppUninstalled(id) || appRegistry.isAppDisabled(id)) return false;
+        return true;
+      })
+      .map(([id, data]) => ({ app: id, ...data }));
+    return this.gamesCache;
+  }
+}
+
+function handleGameUrlParam(renderer, container, onLaunch, wm = null) {
+  renderer.render(container, onLaunch, wm);
+
+  const urlParams = new URLSearchParams(window.location.search);
+  const gameParam = urlParams.get("steam");
+  if (!gameParam) return;
+
+  const matchedGame = renderer.getGames().find((g) => g.app === gameParam);
+  if (!matchedGame) return;
+
+  setTimeout(() => {
+    const sidebarEl = container.querySelector(".steam-library-sidebar");
+    const libraryPageEl = container.querySelector(".steam-library-page");
+    const storePageEl = container.querySelector(".steam-store-page");
+    const communityPageEl = container.querySelector(".steam-community-page");
+    const downloadsPageEl = container.querySelector(".steam-downloads-page");
+    const tabEls = container.querySelectorAll(".steam-tab");
+
+    [libraryPageEl, storePageEl, communityPageEl, downloadsPageEl].forEach((p) => p && p.classList.add("hidden"));
+    tabEls.forEach((t) => t.classList.remove("active"));
+    const libTab = container.querySelector(".steam-tab[data-page='library']");
+    if (libTab) libTab.classList.add("active");
+    if (libraryPageEl) libraryPageEl.classList.remove("hidden");
+    if (sidebarEl) sidebarEl.classList.remove("hidden");
+
+    renderer.renderGameOverview(container, gameParam, onLaunch);
+
+    const sidebarItems = container.querySelectorAll(".sidebar-game-item");
+    sidebarItems.forEach((item) => {
+      item.classList.toggle("active", item.dataset.app === gameParam);
+    });
+
+    const activeItem = container.querySelector(`.sidebar-game-item[data-app="${gameParam}"]`);
+    if (activeItem) {
+      activeItem.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  }, 1600);
+}

@@ -1,0 +1,837 @@
+import { sanitizeTitle } from "./utils/utils.js";
+import { HIGHLIGHTED_GAMES, getGameName } from "./games/games.js";
+import { appMap } from "./games/gamesList.js";
+import { SYSTEM_APPS } from "./AppRegistryConfig.js";
+import { createAppActions } from "./AppActions.js";
+import { initializeAppGrid, tryGetIcon, trackRecentlyUsed } from "./desktopui/startMenu.js";
+const IFRAME_ATTRS =
+  'style="width:100%;height:100%;border:none;" allow="autoplay; fullscreen; clipboard-write; encrypted-media; picture-in-picture" sandbox="allow-forms allow-downloads allow-modals allow-pointer-lock allow-popups allow-same-origin allow-scripts allow-top-navigation-by-user-activation"';
+import { getLibraryUrl } from "./shared/cdnConfig.js";
+import { StorageKeys, os, $ } from "./framework.js";
+import { buildPlayerConfig } from "./ruffle/ruffleSettings.js";
+import { getWispUrl } from "./shared/wispConfig.js";
+import { parseBool } from "./utils/utils.js";
+import {
+  fetchHtmlAsBlobUrl,
+  resolveUrl,
+  resolveIconUrl,
+  looksLikeHtml,
+  isCdnGhUrl,
+  isCdnHostname,
+  isJsdelivrGhUrl,
+  getCurrentCdnRepoBase,
+  resolveGhUrl
+} from "./shared/assetResolver.js";
+import { yukiITDevToolsBridge, YUKI_DEV_TOOLS_URL } from "./yukiITDevToolsBridge.js";
+import { ClippyAnimation, initClippy, speak } from "./ai/clippy.js";
+const clippySpeak = speak;
+import { GameOverlayController } from "./gameOverlay.js";
+import "./styles/gameOverlay.css";
+import { initAnalytics, getAnalyticsBase, sendLaunchAnalytics, recordUsageDuration } from "./analytics.js";
+import { maybeTriggerSmartlink, buildGameAdBannerHtml, ADSTERRA_KEYS, shouldEnableAds } from "./ads.js";
+import { getNewsContentSignature, updateNewsBadge } from "./apps/news.js";
+import { SteamSettings } from "./games/steamSettings.js";
+import { PROXIES, clampProxyIndex, buildProxyUrl, fetchHtmlThroughProxy, fetchDirectAsBlobUrl } from "./proxies.js";
+import { trigger as triggerCursorEffect } from "./cursorEffect.js";
+const STATICALLY_BASE = resolveGhUrl("https://cdn.jsdelivr.net/gh/NaoTomori1/yukios-games@main");
+
+export class AppLauncher {
+  wm;
+  fs;
+  services;
+  taskManager;
+  adsManager;
+  brightnessApp;
+  TRANSPARENCY_ALLOWED_APP_IDS;
+  clippyPromise;
+  appRegistry;
+  BIC;
+  appMap;
+  launchedAppIds;
+  appSessions;
+  clippyMap;
+
+  constructor(windowManager, fileSystemManager, services = {}) {
+    this.wm = windowManager;
+    this.fs = fileSystemManager;
+
+    this.services = services instanceof Map ? Object.fromEntries(services) : services;
+    Object.assign(this, this.services);
+
+    this.taskManager = this.services.taskManagerApp;
+    this.adsManager = this.services.adsApp;
+    this.brightnessApp = this.services.displayPerformanceApp;
+
+    this.TRANSPARENCY_ALLOWED_APP_IDS = new Set(["paint", "photopea", "vscode"]);
+
+    this.clippyPromise = initClippy();
+
+    initAnalytics();
+
+    const settings = SteamSettings.load();
+    if (settings.runOnStartup && !window.steamStartupHandled) {
+      window.steamStartupHandled = true;
+      setTimeout(() => {
+        this.launch("steamApp");
+        if (settings.startMinimized) {
+          setTimeout(() => {
+            const steamWin = $("#games-app-win");
+            if (steamWin) {
+              const wm = this.wm;
+              wm.minimize(steamWin);
+            }
+          }, 500);
+        }
+      }, 1000);
+    }
+
+    this.appRegistry = new Map();
+
+    this.registerAppsFromMap();
+
+    this.BIC = "badIceCream";
+
+    const appActions = createAppActions(this);
+
+    const systemAppsWithActions = Object.fromEntries(
+      Object.entries(SYSTEM_APPS).map(([appId, metadata]) => {
+        const action = appActions[appId];
+        return [appId, { ...metadata, ...(action ? { action } : {}) }];
+      })
+    );
+
+    this.clippyMap = Object.fromEntries(
+      Object.entries(SYSTEM_APPS)
+        .filter(([, v]) => v.clippy)
+        .map(([k, v]) => [k, v.clippy])
+    );
+
+    this.clippyMap["vscode"] = { message: "Code editor ready.", animation: ClippyAnimation.GetWizardy };
+    this.appMap = { ...appMap, ...systemAppsWithActions };
+    this.launchedAppIds = this.loadLaunchedApps();
+    this.appSessions = new Map();
+    this.initSteamTracking();
+    requestIdleCallback(() => initializeAppGrid(), { timeout: 2000 });
+
+    const currentNewsSig = getNewsContentSignature();
+    const savedNewsSig = os.storage.get(StorageKeys.newsReadSignatureKey);
+    const legacyNewsSeen = parseBool(os.storage.get(StorageKeys.newsSeenKey));
+    const setupCompleted = parseBool(os.storage.get(StorageKeys.setupCompleted));
+
+    if (!savedNewsSig && legacyNewsSeen) {
+      os.storage.set(StorageKeys.newsReadSignatureKey, currentNewsSig);
+    } else if (savedNewsSig !== currentNewsSig && setupCompleted) {
+      setTimeout(() => {
+        this.launch("newsApp");
+        os.storage.set(StorageKeys.newsReadSignatureKey, currentNewsSig);
+        os.storage.set(StorageKeys.newsSeenKey, "true");
+      }, 1000);
+    }
+
+    setTimeout(() => {
+      updateNewsBadge();
+    }, 500);
+
+    this.ensureIframeNavigateHandler();
+
+    this.overlayController = new GameOverlayController(os);
+  }
+
+  setEmulatorApp(emulatorApp) {
+    this.emulatorApp = emulatorApp;
+  }
+
+  listRunningApps() {
+    const apps = [];
+    const seen = new Set();
+    this.wm.openWindows.forEach((entry, winId) => {
+      if (seen.has(winId)) return;
+      seen.add(winId);
+      if (os.tray.isInTray(winId)) return;
+      apps.push({
+        winId,
+        title: entry.title || winId,
+        icon: entry.iconValue || "fas fa-window-maximize",
+        status: "Running"
+      });
+    });
+    return apps;
+  }
+
+  registerAppsFromMap() {
+    for (const [appId, metadata] of Object.entries(SYSTEM_APPS)) {
+      const serviceKey = metadata.serviceKey || appId;
+      const instance = this.services[serviceKey] || this[appId] || this[appId + "App"];
+      if (instance) {
+        this.appRegistry.set(appId, instance);
+      }
+    }
+  }
+
+  async speak(message, animation) {
+    await clippySpeak(message, animation);
+  }
+
+  ensureIframeNavigateHandler() {
+    if (this.iframeNavigateHandlerInstalled) return;
+    this.iframeNavigateHandlerInstalled = true;
+
+    window.addEventListener("message", async (event) => {
+      const data = event?.data;
+      if (!data || data.__yukios !== "navigate" || typeof data.url !== "string") return;
+
+      let sourceIframe = null;
+      for (const iframe of $("#desktop").querySelectorAll("iframe")) {
+        if (iframe.contentWindow === event.source) {
+          sourceIframe = iframe;
+          break;
+        }
+      }
+      if (!sourceIframe) return;
+
+      let nextUrl = data.url;
+      const prevSrc = sourceIframe.getAttribute("src") || "";
+
+      try {
+        if (looksLikeHtml(nextUrl) && isCdnGhUrl(nextUrl)) {
+          const blobUrl = await fetchHtmlAsBlobUrl(nextUrl);
+          sourceIframe.src = blobUrl;
+        } else {
+          sourceIframe.src = nextUrl;
+        }
+      } finally {
+        if (prevSrc.startsWith("blob:") && prevSrc !== sourceIframe.src) {
+          try {
+            URL.revokeObjectURL(prevSrc);
+          } catch {}
+        }
+      }
+    });
+  }
+
+  async launch(app, swf = false, extra = null) {
+    if (app === "installedAppsApp") app = "systemAppsApp";
+    const info = this.appMap[app];
+    if (!info) {
+      console.error(`App ${app} not found.`);
+      return;
+    }
+
+    triggerCursorEffect(info.icon);
+
+    if (typeof info.url === "string" && isCdnGhUrl(info.url)) {
+      info.url = resolveGhUrl(info.url);
+    }
+    if (typeof info.swf === "string" && isCdnGhUrl(info.swf)) {
+      info.swf = resolveGhUrl(info.swf);
+    }
+    if (typeof info.html === "string" && isCdnGhUrl(info.html)) {
+      info.html = resolveGhUrl(info.html);
+    }
+
+    if (!this.launchedAppIds.has(app)) {
+      this.launchedAppIds.add(app);
+      this.saveLaunchedApps();
+      os.achievements.incrementAppLaunched();
+    }
+    trackRecentlyUsed(app);
+    if (info.type !== "system") {
+      os.achievements.incrementGameLaunched();
+    }
+    const analyticsBase = getAnalyticsBase(app);
+    sendLaunchAnalytics(app);
+
+    const clippyEntry = this.clippyMap[app];
+    if (clippyEntry) {
+      clippySpeak(clippyEntry.message, clippyEntry.animation);
+    }
+
+    const appExtra = { ...(extra || {}), appId: app, appType: info.type };
+
+    if (info.type === "system") {
+      if (info.launchType === "remote") {
+        this.openRemoteApp(info.source || info.url);
+      } else if (info.launchType === "iframe" && info.source) {
+        this.openIframeApp({
+          appId: app,
+          type: "game",
+          source: info.source,
+          originalName: app,
+          analyticsBase,
+          ...appExtra
+        });
+      } else if (info.url) {
+        this.openIframeApp({
+          appId: app,
+          type: "game",
+          source: info.url,
+          originalName: app,
+          analyticsBase,
+          ...appExtra
+        });
+      } else if (info.action) {
+        await info.action.call(this, appExtra);
+      } else if (info.launchType === "instance") {
+        const appInstance = this.appRegistry.get(app);
+        if (appInstance) {
+          await appInstance.open(appExtra);
+        } else {
+          console.warn(`No open() method found for app: ${app}`);
+        }
+      }
+      return;
+    }
+
+    const handlers = {
+      swf: () =>
+        this.openIframeApp({ appId: app, type: "swf", source: info.swf || info.url, originalName: app, ...appExtra }),
+      gba: () => this.openIframeApp({ appId: app, type: "gba", source: info.url, originalName: app, ...appExtra }),
+      psp: () => this.openIframeApp({ appId: app, type: "psp", source: info.url, originalName: app, ...appExtra }),
+      nds: () => this.openIframeApp({ appId: app, type: "nds", source: info.url, originalName: app, ...appExtra }),
+      megadrive: () =>
+        this.openIframeApp({ appId: app, type: "segaMD", source: info.url, originalName: app, ...appExtra }),
+      genesis: () =>
+        this.openIframeApp({ appId: app, type: "segaMD", source: info.url, originalName: app, ...appExtra }),
+      game: async () => {
+        let source = info.url;
+
+        if (info?.scramjetEnabled) {
+          const wispUrl = getWispUrl();
+          source = `/sapps/set-template.html?wisp=${encodeURIComponent(wispUrl)}&target=${encodeURIComponent(info.url)}`;
+        } else if (info?.blobEnabled && typeof source === "string" && /^https?:\/\//.test(source)) {
+          const proxyIndex = clampProxyIndex(info.proxyIndex, PROXIES);
+          try {
+            if (info?.proxyEnabled) {
+              source = await fetchHtmlThroughProxy(source, proxyIndex, PROXIES);
+            } else {
+              source = await fetchDirectAsBlobUrl(source);
+            }
+          } catch (e) {
+            console.warn("[AppLauncher blob] fetch failed, fallback to proxy/direct", e);
+            if (info?.proxyEnabled) {
+              const fallback = buildProxyUrl(source, proxyIndex, PROXIES);
+              if (fallback) source = fallback;
+            }
+          }
+        } else if (info?.proxyEnabled && typeof source === "string" && /^https?:\/\//.test(source)) {
+          const proxyIndex = clampProxyIndex(info.proxyIndex, PROXIES);
+          try {
+            source = await fetchHtmlThroughProxy(source, proxyIndex, PROXIES);
+          } catch (e) {
+            source = buildProxyUrl(source, proxyIndex, PROXIES);
+          }
+        }
+        this.openIframeApp({ appId: app, type: "game", source, originalName: app, analyticsBase, ...appExtra });
+      },
+      html: () => this.openHtmlApp(app, info.html, info),
+      remote: () => this.openRemoteApp(info.url)
+    };
+    const handler = handlers[info.type];
+    if (handler) {
+      await handler();
+    }
+
+    maybeTriggerSmartlink();
+    os.events.emit("app:launched", { appId: app });
+  }
+
+  loadLaunchedApps() {
+    try {
+      const saved = os.storage.get(StorageKeys.launchedApps);
+      if (saved) return new Set(saved);
+    } catch (e) {}
+    return new Set();
+  }
+
+  saveLaunchedApps() {
+    try {
+      os.storage.set(StorageKeys.launchedApps, [...this.launchedAppIds]);
+    } catch (e) {}
+  }
+
+  initSteamTracking() {
+    const oldRemove = this.wm.removeFromTaskbar.bind(this.wm);
+    this.wm.removeFromTaskbar = (winId) => {
+      const session = this.appSessions.get(winId);
+      if (session) {
+        const durationMs = Date.now() - session.startTime;
+        const durationMin = Math.round(durationMs / 60000);
+        this.updateSteamStats(session.appId, durationMin);
+        if (durationMs >= 60000) recordUsageDuration(session.appId, durationMs);
+        this.appSessions.delete(winId);
+        this.adsManager?.onGameClosed();
+      }
+      return oldRemove(winId);
+    };
+  }
+
+  updateSteamStats(appId, minutes) {
+    try {
+      const now = Date.now();
+      const TWO_WEEKS_MS = 14 * 24 * 60 * 60 * 1000;
+
+      const stats = os.storage.get(StorageKeys.steamStats) || {};
+      if (!stats[appId]) {
+        stats[appId] = { totalMin: 0, lastPlayed: 0 };
+      }
+      stats[appId].totalMin += minutes;
+      stats[appId].lastPlayed = now;
+      os.storage.set(StorageKeys.steamStats, stats);
+
+      const sessions = os.storage.get(StorageKeys.steamSessions) || {};
+      if (!sessions[appId]) sessions[appId] = [];
+      sessions[appId].push({ ts: now, min: minutes });
+      sessions[appId] = sessions[appId].filter((s) => now - s.ts < TWO_WEEKS_MS);
+      os.storage.set(StorageKeys.steamSessions, sessions);
+    } catch (e) {}
+  }
+
+  async openRemoteApp(appUrl) {
+    const isStaticallyGh = isCdnGhUrl(window.location.href);
+    if (isStaticallyGh && typeof appUrl === "string" && appUrl.startsWith("/")) {
+      appUrl = `${STATICALLY_BASE}${appUrl}`;
+    }
+    sendLaunchAnalytics(appUrl);
+    if (typeof appUrl === "string" && isJsdelivrGhUrl(appUrl)) {
+      try {
+        const blobUrl = await fetchHtmlAsBlobUrl(appUrl);
+        window.open(blobUrl, "_blank", "noopener,noreferrer");
+        return;
+      } catch {}
+    }
+    window.open(appUrl, "_blank", "noopener,noreferrer");
+  }
+
+  async openYukiDevToolsApp(extra = {}) {
+    const appId = "yukiDevTools";
+    if (this.bringToFrontIfExists(appId)) return;
+
+    const title = this.appMap[appId]?.title || "Yuki Dev Tools";
+    let iframeUrl = YUKI_DEV_TOOLS_URL;
+
+    try {
+      iframeUrl = await yukiITDevToolsBridge(YUKI_DEV_TOOLS_URL);
+    } catch (err) {
+      console.error("Failed to build bridged Yuki Dev Tools iframe", err);
+    }
+
+    const contentHtml = `<iframe src="${iframeUrl}" ${IFRAME_ATTRS}></iframe>`;
+    this.createWindow(appId, title, contentHtml, YUKI_DEV_TOOLS_URL, appId, {
+      type: "game",
+      ...extra
+    });
+  }
+
+  openHtmlApp(appName, htmlContent, appMeta) {
+    if (this.bringToFrontIfExists(appName)) return;
+    this.createWindow(
+      appName,
+      appName.replace(/([A-Z])/g, " $1").replace(/^./, (s) => s.toUpperCase()),
+      htmlContent,
+      null,
+      appName,
+      appMeta
+    );
+  }
+
+  async openIframeApp({ appId, type, source, originalName, analyticsBase = null, ...extra }) {
+    this.fetchHtmlAsBlobUrl = fetchHtmlAsBlobUrl;
+
+    let id;
+    let contentHtml;
+    let externalUrl = null;
+
+    if (type === "swf") {
+      if (typeof source !== "string" || !source) {
+        console.error(`SWF source missing for app ${appId}.`);
+        return;
+      }
+      id = source.replace(/[^a-zA-Z0-9]/g, "");
+      if (this.bringToFrontIfExists(id)) return;
+
+      const gameName = getGameName(originalName) || originalName;
+      const swfPath = await resolveUrl(source);
+
+      const ruffleConfig = buildPlayerConfig();
+      const ruffleConfigJson = JSON.stringify(ruffleConfig).replace(/</g, "\\u003c");
+      const swfHtml = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>${gameName}</title>
+<script src="${getLibraryUrl("ruffle") || "https://cdn.jsdelivr.net/npm/@ruffle-rs/ruffle@0.2.0-nightly.2026.5.15/ruffle.js"}"></script>
+<style>html,body{margin:0;padding:0;width:100%;height:100%;background:${ruffleConfig.backgroundColor || "#000"};overflow:hidden;}#player{width:100%;height:100%;}</style>
+</head>
+<body>
+<div id="player"></div>
+<script>
+const __ruffleCfg = ${ruffleConfigJson};
+const ruffle=window.RufflePlayer.newest();
+const player=ruffle.createPlayer();
+player.config = __ruffleCfg;
+player.style.width="100%";
+player.style.height="100%";
+player.style.display="block";
+document.getElementById("player").appendChild(player);
+player.load("${swfPath}");
+<\/script>
+</body>
+</html>`;
+
+      const swfBlob = URL.createObjectURL(new Blob([swfHtml], { type: "text/html" }));
+      contentHtml = `<iframe src="${swfBlob}" ${IFRAME_ATTRS}></iframe>`;
+      externalUrl = swfBlob;
+    } else {
+      id = type === "game" ? appId : `${type}-${source.replace(/\W/g, "")}-${Date.now()}`;
+      if (this.bringToFrontIfExists(id)) return;
+
+      const shouldBypassResolution =
+        type !== "game" &&
+        type !== "swf" &&
+        typeof source === "string" &&
+        !source.startsWith("blob:") &&
+        !source.startsWith("data:") &&
+        !source.startsWith("http://") &&
+        !source.startsWith("https://") &&
+        !source.startsWith("/");
+
+      const isCdnGh = isCdnHostname(window.location.hostname) && window.location.pathname.includes("/gh/");
+
+      const isLocalhostUrl = (() => {
+        if (typeof source !== "string") return false;
+        try {
+          const url = new URL(source, window.location.origin);
+          return url.hostname === "localhost" || url.hostname === "127.0.0.1";
+        } catch {
+          return false;
+        }
+      })();
+      let resolvedSource = source;
+      if (!shouldBypassResolution && !isCdnGh && !isLocalhostUrl) {
+        resolvedSource = await resolveUrl(source, isCdnGhUrl(window.location.href));
+      }
+
+      if (typeof resolvedSource === "string" && resolvedSource.includes("static/apps/azahar")) {
+        const mirrors = ["https://yukios.netlify.app/", "https://yukios.pages.dev/"];
+
+        for (const mirror of mirrors) {
+          try {
+            const testUrl = new URL("static/apps/azahar/index.html", mirror).href;
+            const res = await fetch(testUrl, { method: "HEAD" });
+            if (res.ok) {
+              resolvedSource = testUrl;
+              break;
+            }
+          } catch (e) {}
+        }
+      } else if (typeof resolvedSource === "string" && resolvedSource.includes("static/apps/kiwiirc")) {
+        const mirrors = ["https://yukios.netlify.app/", "https://yukios.pages.dev/"];
+
+        for (const mirror of mirrors) {
+          try {
+            const testUrl = new URL("static/apps/kiwiirc/index.html", mirror).href;
+            const res = await fetch(testUrl, { method: "HEAD" });
+            if (res.ok) {
+              resolvedSource = testUrl;
+              break;
+            }
+          } catch (e) {}
+        }
+      } else if (isCdnGh && typeof resolvedSource === "string" && resolvedSource.startsWith("/")) {
+        if (!resolvedSource.includes("localhost:4000")) {
+          const repoBase = getCurrentCdnRepoBase();
+          if (repoBase) {
+            resolvedSource = `${repoBase}${resolvedSource}`;
+          } else {
+            try {
+              resolvedSource = new URL(resolvedSource, window.location.href).href;
+            } catch {}
+          }
+        }
+      }
+
+      const isSameOrigin = (() => {
+        try {
+          return new URL(resolvedSource).origin === window.location.origin;
+        } catch {
+          return false;
+        }
+      })();
+
+      let iframeUrl;
+
+      if (type !== "game") {
+        contentHtml = `<iframe src="${resolvedSource}" ${IFRAME_ATTRS}></iframe>`;
+      }
+
+      if (type === "game") {
+        const displayTitle = this.appMap[appId]?.title || originalName;
+        const isGame = this.isTransparencyBlocked(appId, { type });
+        const gameIcon = this.appMap[appId]?.icon || "fas fa-gamepad";
+        const resolvedGameIcon = resolveIconUrl(gameIcon);
+        const gameIconHtml = this.buildWindowIconHtml(resolvedGameIcon, {
+          margin: "6px",
+          iconVerticalAlign: true
+        });
+
+        if (window.electronAPI) {
+          let nativeWidth = 1280;
+          let nativeHeight = 900;
+          if (extra.width) {
+            const parsed = parseInt(String(extra.width).replace(/[^0-9]/g, ""));
+            if (!isNaN(parsed)) nativeWidth = parsed;
+          }
+          if (extra.height) {
+            const parsed = parseInt(String(extra.height).replace(/[^0-9]/g, ""));
+            if (!isNaN(parsed)) nativeHeight = parsed;
+          }
+          const nativeIcon = resolvedGameIcon.startsWith("http") ? resolvedGameIcon : undefined;
+          window.electronAPI.openNativeWindow({
+            url: resolvedSource,
+            title: displayTitle,
+            icon: nativeIcon,
+            width: nativeWidth,
+            height: nativeHeight
+          });
+          return;
+        }
+
+        const win = os.window.create(
+          extra.forceId || `${id}-win`,
+          displayTitle,
+          extra.width || "80vw",
+          extra.height || "80vh",
+          {
+            ...extra,
+            isGame,
+            icon: gameIcon,
+            skipHeader: true
+          }
+        );
+        if (appId) this.appSessions.set(`${id}-win`, { appId, startTime: Date.now() });
+
+        Object.assign(win.dataset, {
+          appType: type,
+          externalUrl: resolvedSource || "",
+          appId: appId || "",
+          swf: type === "swf" ? source : "",
+          isGame,
+          rom: type !== "game" && type !== "swf" ? source : "",
+          core: type !== "game" && type !== "swf" ? type : ""
+        });
+
+        const overlayBtnHtml = isGame
+          ? `<button class="overlay-open-btn" title="Yuki Steam Overlay (Shift+Tab)"><i class="fab fa-steam"></i></button>`
+          : "";
+
+        win.innerHTML = `
+          ${this.buildWindowHeaderMarkup(
+            gameIconHtml,
+            displayTitle,
+            overlayBtnHtml,
+            os.window.getWindowControls(resolvedSource, true)
+          )}
+          <div class="window-content" style="width:100%; height:100%; overflow:hidden; display:flex; align-items:center; justify-content:center; background:#1a1a1a;">
+            <div class="modern-loader">
+              <div class="loader-dots">
+                <div class="loader-dot"></div>
+                <div class="loader-dot"></div>
+                <div class="loader-dot"></div>
+              </div>
+              <div class="loader-text">Loading</div>
+            </div>
+          </div>
+        `;
+
+        win.querySelector(".overlay-open-btn")?.addEventListener("click", () => {
+          this.overlayController.openForWindow(win);
+        });
+
+        win.querySelector(".external-btn")?.addEventListener("click", () => {
+          window.open(resolvedSource, "blank");
+        });
+
+        if (resolvedSource.startsWith("blob:")) {
+          iframeUrl = resolvedSource;
+        } else if (
+          looksLikeHtml(resolvedSource) &&
+          /^https?:\/\//.test(resolvedSource) &&
+          !isSameOrigin &&
+          (isCdnGhUrl(resolvedSource) || isCdnGhUrl(window.location.href))
+        ) {
+          try {
+            const injectBannerHtml =
+              extra.isArchive && shouldEnableAds() ? buildGameAdBannerHtml(ADSTERRA_KEYS.leaderboard) : "";
+            const skipRewrite = !!this.appMap[appId]?.skipRewrite;
+            iframeUrl = await fetchHtmlAsBlobUrl(resolvedSource, { injectBannerHtml, skipRewrite });
+          } catch (err) {
+            const message = err?.message ? String(err.message) : "Unknown error";
+            const errHtml = `<!doctype html><meta charset="utf-8"><title>Failed to load</title>
+<style>body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:16px}code{background:#f2f2f2;padding:2px 4px;border-radius:4px}</style>
+<h2>Failed to fetch page</h2><p><strong>URL:</strong> <code>${resolvedSource}</code></p><p><strong>Error:</strong> <code>${message}</code></p>`;
+            iframeUrl = URL.createObjectURL(new Blob([errHtml], { type: "text/html" }));
+          }
+        } else {
+          iframeUrl = resolvedSource;
+        }
+
+        const contentDiv = win.querySelector(".window-content");
+        if (contentDiv) {
+          contentDiv.innerHTML = `<iframe src="${iframeUrl}" ${IFRAME_ATTRS}></iframe>`;
+        }
+
+        win.addEventListener("remove", () => {
+          if (iframeUrl?.startsWith("blob:"))
+            try {
+              URL.revokeObjectURL(iframeUrl);
+            } catch {}
+          if (resolvedSource?.startsWith("blob:"))
+            try {
+              URL.revokeObjectURL(resolvedSource);
+            } catch {}
+        });
+
+        if (type === "game") externalUrl = resolvedSource;
+        return;
+      } else {
+        this.emulatorApp.launchFromUrl(resolvedSource, type);
+        return;
+      }
+    }
+
+    const displayTitle = this.appMap[appId]?.title || getGameName(originalName) || originalName;
+
+    this.createIframeWindow(
+      id,
+      displayTitle,
+      contentHtml,
+      appId,
+      {
+        type,
+        swf: type === "swf" ? source : undefined,
+        rom: type !== "game" && type !== "swf" ? source : undefined,
+        core: type !== "game" && type !== "swf" ? type : undefined
+      },
+      analyticsBase,
+      externalUrl
+    );
+  }
+
+  bringToFrontIfExists(id) {
+    const el = $(`#${id}-win`);
+    if (el) os.window.bringToFront(el);
+    return !!el;
+  }
+
+  createIframeWindow(id, title, contentHtml, appId, appMeta, analyticsBase = null, externalUrl = null) {
+    this.createWindow(id, title, contentHtml, externalUrl, appId, appMeta);
+  }
+
+  isTransparencyBlocked(appId, appMeta) {
+    return !(appMeta.type === "system" || this.TRANSPARENCY_ALLOWED_APP_IDS.has(appId));
+  }
+
+  buildWindowIconHtml(resolvedIcon, options = {}) {
+    const { margin = "8px", iconVerticalAlign = false } = options;
+    const isFontIcon =
+      resolvedIcon.startsWith("fas ") || resolvedIcon.startsWith("fab ") || resolvedIcon.startsWith("far ");
+    const vertAlignStyle = iconVerticalAlign ? "vertical-align:middle;" : "";
+    return isFontIcon
+      ? `<i class="${resolvedIcon}" style="margin-right:${margin};font-size:16px;${vertAlignStyle}"></i>`
+      : `<img src="${resolvedIcon}" style="width:20px;height:20px;margin-right:${margin};vertical-align:middle;object-fit:contain;">`;
+  }
+
+  buildWindowHeaderMarkup(iconHtml, title, overlayBtnHtml, controlsHtml) {
+    return `
+      <div class="window-header">
+        <span>${iconHtml}${title}</span>
+        <div class="window-header-actions">
+          ${overlayBtnHtml}
+          ${controlsHtml}
+        </div>
+      </div>
+    `;
+  }
+
+  createWindow(id, title, contentHtml, externalUrl = null, appId = null, appMeta = {}) {
+    const urlParams = new URLSearchParams(window.location.search);
+    if (urlParams.has("game") && appId) {
+      if (window.__yukiCloakActive !== true) document.title = sanitizeTitle(title);
+      document.head.insertAdjacentHTML(
+        "beforeend",
+        `<style>
+          html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: black;
+          }
+        </style>`
+      );
+      document.body.innerHTML = `<div id="electron-game-root" style="width:100vw;height:100vh;margin:0;padding:0;overflow:hidden;">${contentHtml}</div>`;
+      return;
+    }
+
+    const isGame = this.isTransparencyBlocked(appId, appMeta);
+    const mapEntry = this.appMap[appId];
+    let icon =
+      mapEntry?.iconValue ||
+      mapEntry?.icon ||
+      (appMeta.type === "swf" ? "static/icons/flash.webp" : tryGetIcon(appId || id));
+
+    if (!icon) {
+      icon = "fas fa-window-maximize";
+    }
+
+    const win = os.window.create(`${id}-win`, title, "80vw", "80vh", {
+      isGame,
+      icon
+    });
+    if (appId) this.appSessions.set(`${id}-win`, { appId, startTime: Date.now() });
+
+    Object.assign(win.dataset, {
+      appType: appMeta.type || "",
+      externalUrl: externalUrl || "",
+      appId: appId || "",
+      swf: appMeta.swf || "",
+      isGame,
+      rom: appMeta.rom || "",
+      core: appMeta.core || ""
+    });
+
+    const resolvedIcon = resolveIconUrl(icon);
+    const iconHtml = this.buildWindowIconHtml(resolvedIcon, { margin: "8px" });
+
+    const overlayBtnHtml = isGame
+      ? `<button class="overlay-open-btn" title="Yuki Steam Overlay (Shift+Tab)"><i class="fab fa-steam"></i></button>`
+      : "";
+
+    win.innerHTML = `
+      ${this.buildWindowHeaderMarkup(iconHtml, title, overlayBtnHtml, os.window.getWindowControls(externalUrl, true))}
+      <div class="window-content" style="width:100%; height:100%; overflow:hidden;">${contentHtml}</div>
+    `;
+
+    win.querySelector(".overlay-open-btn")?.addEventListener("click", () => {
+      this.overlayController.openForWindow(win);
+    });
+
+    win.querySelector(".external-btn")?.addEventListener("click", () => {
+      const url = win.dataset.externalUrl || win.querySelector("iframe")?.src || externalUrl;
+      if (url) window.open(url, "blank", "noopener,noreferrer");
+    });
+
+    win.addEventListener("remove", () => {
+      if (externalUrl?.startsWith("blob:"))
+        try {
+          URL.revokeObjectURL(externalUrl);
+        } catch {}
+      const iframeSrc = win.querySelector("iframe")?.src;
+      if (iframeSrc?.startsWith("blob:") && iframeSrc !== externalUrl)
+        try {
+          URL.revokeObjectURL(iframeSrc);
+        } catch {}
+    });
+  }
+}

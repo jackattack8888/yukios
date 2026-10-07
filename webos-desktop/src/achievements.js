@@ -1,0 +1,812 @@
+import confetti from "canvas-confetti";
+import { BusEvents } from "./core/EventBus.js";
+import { resolveGhUrl } from "./shared/assetResolver.js";
+import { audioMixer } from "./audioMixer.js";
+import { $, $$, createElement } from "./shared/domUtils.js";
+import { parseBool } from "./utils/utils.js";
+
+import { BaseApp, StorageKeys, os } from "./framework.js";
+import { getLiveUserId, ensureLiveUserId } from "./social/userIdentity.js";
+import { reportAchievements } from "./social/socialApi.js";
+export const Achievements = {
+  MultiTasker: "window_manager",
+  PersonalSpace: "personal_space",
+  DesktopStylist: "desktop_stylist",
+  AppCollector: "app_collector",
+  Skid: "skid",
+  TerminalUser: "terminal_user",
+  FirstGame: "first_game",
+  GameHopper: "game_hopper",
+  GameHopperMega: "game_hopper_mega",
+  RetroPlayer: "retro_player",
+  ChaosMode: "chaos_mode",
+  RegularUser: "regular_user",
+  Completionist: "completionist",
+  SetupComplete: "setup_complete",
+  IntroTourComplete: "intro_tour_complete",
+  FontCustomizer: "font_customizer",
+  WorkspaceWanderer: "workspace_wanderer",
+  WorkspaceArchitect: "workspace_architect",
+  MathWhiz: "math_whiz",
+  NightPerson: "night_owl",
+  PowerUser: "power_user",
+  Customizer: "customizer",
+  Flashback: "flashback",
+  Converter: "converter",
+  WidgetAdded: "widget_added",
+  ThemeSmith: "theme_smith",
+  MacroMaker: "macro_maker",
+  GhostMode: "ghost_mode",
+  PinCushion: "pin_cushion",
+  Sampler: "sampler"
+};
+
+let sharedCatalog = null;
+
+export function getAchievementCatalog() {
+  return sharedCatalog || [];
+}
+
+export class AchievementsApp extends BaseApp {
+  singletonWindowIds = ["achievements-yukios"];
+
+  constructor(services) {
+    super(services);
+    this.achievements = this.createAchievements();
+    this.unlocked = new Map();
+    this.s1 = new Audio(resolveGhUrl("https://cdn.jsdelivr.net/gh/NaoTomori1/yukios@main/static/audio/steam.opus"));
+
+    this.initBusListeners();
+    this.thresholds = {
+      openWindows: [
+        { at: 5, key: Achievements.MultiTasker },
+        { at: 10, key: Achievements.ChaosMode }
+      ],
+      appLaunched: [{ at: 15, key: Achievements.AppCollector }],
+      terminalCmd: [{ at: 5, key: Achievements.TerminalUser }],
+      gameLaunched: [
+        { at: 1, key: Achievements.FirstGame },
+        { at: 10, key: Achievements.GameHopper },
+        { at: 100, key: Achievements.GameHopperMega }
+      ],
+      wallpaper: [{ at: 5, key: Achievements.DesktopStylist }],
+      session: [{ at: 5, key: Achievements.RegularUser }],
+      workspaceSwitched: [{ at: 10, key: Achievements.WorkspaceWanderer }],
+      workspaceAdded: [{ at: 3, key: Achievements.WorkspaceArchitect }],
+      calculationDone: [{ at: 10, key: Achievements.MathWhiz }],
+      powerProfileChange: [{ at: 5, key: Achievements.PowerUser }]
+    };
+    this.counters = {};
+    this.achievementQueue = [];
+    this.isShowingAchievement = false;
+    this.syncTimer = null;
+    this.syncOnPageHide = () => {
+      this.flushSync();
+    };
+    window.addEventListener("pagehide", this.syncOnPageHide);
+    this.loadFromStorage();
+    ensureLiveUserId()
+      .then(() => this.syncAchievements())
+      .catch(() => {});
+  }
+
+  open(opts = {}) {
+    const win = os.window.create("achievements-yukios", "Achievements", "800px", "40em", {
+      icon: "papirus:actions/games-achievements",
+      appId: "achievements-yukios"
+    });
+
+    win.innerHTML = `<div class="window-content achievements-content">
+        <div class="achievements-scroll">
+          <div class="achievements-hero">
+            <div class="achievements-hero__bg"></div>
+            <div class="achievements-hero__content">
+              <div class="achievements-hero__icon-wrapper">
+                <img src="https://cdn.jsdelivr.net/gh/PapirusDevelopmentTeam/papirus-icon-theme@master/Papirus/22x22/actions/games-achievements.svg" class="papirus-icon papirus-icon--22" alt="" />
+              </div>
+              <h1 class="achievements-hero__title">Achievements</h1>
+              <p class="achievements-hero__subtitle">Track your progress in YukiOS</p>
+            </div>
+            <div class="achievements-hero__stats">
+              <div class="achievements-hero__stat">
+                <div class="achievements-hero__stat-value">0</div>
+                <div class="achievements-hero__stat-label">Unlocked</div>
+              </div>
+              <div class="achievements-hero__stat">
+                <div class="achievements-hero__stat-value">0%</div>
+                <div class="achievements-hero__stat-label">Complete</div>
+              </div>
+              <div class="achievements-hero__stat">
+                <div class="achievements-hero__stat-value">0</div>
+                <div class="achievements-hero__stat-label">Remaining</div>
+              </div>
+            </div>
+          </div>
+          <div class="achievements-progress">
+            <div class="achievements-progress__header">
+              <span class="achievements-progress__label">Overall Progress</span>
+              <span class="achievements-progress__counter">0 / 0</span>
+            </div>
+            <div class="achievements-progress__bar-wrapper">
+              <div class="achievements-progress__bar">
+                <div class="achievements-progress__fill" style="width: 0%"></div>
+              </div>
+              <span class="achievements-progress__percentage">0%</span>
+            </div>
+          </div>
+          <div class="achievements-toggle">
+            <button class="achievements-toggle__btn achievements-toggle__btn--active" data-filter="all">
+              <img src="https://cdn.jsdelivr.net/gh/PapirusDevelopmentTeam/papirus-icon-theme@master/Papirus/22x22/actions/view-list.svg" class="papirus-icon papirus-icon--22" alt="" />
+              <span>All</span>
+            </button>
+            <button class="achievements-toggle__btn" data-filter="unlocked">
+              <img src="https://cdn.jsdelivr.net/gh/PapirusDevelopmentTeam/papirus-icon-theme@master/Papirus/22x22/actions/object-select.svg" class="papirus-icon papirus-icon--22" alt="" />
+              <span>Unlocked</span>
+            </button>
+            <button class="achievements-toggle__btn" data-filter="locked">
+              <img src="https://cdn.jsdelivr.net/gh/PapirusDevelopmentTeam/papirus-icon-theme@master/Papirus/22x22/actions/object-locked.svg" class="papirus-icon papirus-icon--22" alt="" />
+              <span>Locked</span>
+            </button>
+          </div>
+          <div class="achievements-grid" id="achievements-grid"></div>
+        </div>
+      </div>`;
+
+    const scroll = win.querySelector(".achievements-scroll");
+    scroll.addEventListener("click", (e) => {
+      const toggleBtn = e.target.closest(".achievements-toggle__btn");
+      if (toggleBtn) {
+        const filter = toggleBtn.dataset.filter || "all";
+        this.currentFilter = filter;
+        this.refresh();
+        return;
+      }
+      if (e.target.closest(".achievements-unlock-all")) {
+        this.unlockAll();
+      }
+    });
+
+    this.refresh();
+  }
+
+  initBusListeners() {
+    os.events.on(BusEvents.WINDOW_CREATED, () => this.incrementWindowOpen());
+    os.events.on(BusEvents.APP_LAUNCHED, () => this.incrementAppLaunched());
+    os.events.on(BusEvents.TERMINAL_CMD_EXECUTED, (data) => this.triggerCommandExecution(data?.command));
+    os.events.on(BusEvents.WALLPAPER_CHANGED, () => this.incrementWallpaper());
+    os.events.on(BusEvents.ACHIEVEMENT_TRIGGER, ({ achievementId }) => this.trigger(achievementId));
+    os.events.on(BusEvents.SESSION_INITIALIZED, () => this.incrementSession());
+    os.events.on(BusEvents.WORKSPACE_SWITCHED, () => this.increment("workspaceSwitched"));
+    os.events.on(BusEvents.WORKSPACE_ADDED, () => this.increment("workspaceAdded"));
+  }
+
+  createAchievements() {
+    if (!sharedCatalog)
+      sharedCatalog = [
+        {
+          id: Achievements.MultiTasker,
+          title: "Juggler",
+          desc: "Run 5 apps simultaneously",
+          icon: "papirus:actions/window-maximize",
+          rarity: "common"
+        },
+        {
+          id: Achievements.ChaosMode,
+          title: "Chaos Mode",
+          desc: "Open 10 apps at once",
+          icon: "papirus:apps/gufw",
+          rarity: "epic"
+        },
+        {
+          id: Achievements.PersonalSpace,
+          title: "Personal Space",
+          desc: "Upload a custom wallpaper",
+          icon: "papirus:mimetypes/image-x-generic",
+          rarity: "common"
+        },
+        {
+          id: Achievements.DesktopStylist,
+          title: "Curator",
+          desc: "Change wallpaper 5 times",
+          icon: "papirus:apps/gpaint",
+          rarity: "rare"
+        },
+        {
+          id: Achievements.AppCollector,
+          title: "App Collector",
+          desc: "Launch 15 different apps",
+          icon: "papirus:actions/view-grid",
+          rarity: "epic"
+        },
+        {
+          id: Achievements.Skid,
+          title: "SKID",
+          desc: "Write neofetch on terminal",
+          icon: "papirus:apps/vscode",
+          rarity: "rare"
+        },
+        {
+          id: Achievements.TerminalUser,
+          title: "First Command",
+          desc: "Execute 5 commands in terminal",
+          icon: "papirus:apps/utilities-terminal",
+          rarity: "uncommon"
+        },
+        {
+          id: Achievements.FirstGame,
+          title: "Insert Coin",
+          desc: "Launch any game",
+          icon: "papirus:apps/preferences-desktop-gaming",
+          rarity: "common"
+        },
+        {
+          id: Achievements.GameHopper,
+          title: "Game Hopper",
+          desc: "Play 10 games",
+          icon: "papirus:apps/codes.nora.gDiceRoller",
+          rarity: "epic"
+        },
+        {
+          id: Achievements.GameHopperMega,
+          title: "Grand Game Hopper",
+          desc: "Play 100 games",
+          icon: "papirus:apps/utilities-tweak-tool",
+          rarity: "legendary"
+        },
+        {
+          id: Achievements.RetroPlayer,
+          title: "Retro Player",
+          desc: "Play a DOS game",
+          icon: "papirus:apps/ghostwriter",
+          rarity: "uncommon"
+        },
+        {
+          id: Achievements.RegularUser,
+          title: "Regular User",
+          desc: "Use the OS across 5 sessions",
+          icon: "papirus:apps/preferences-system-time",
+          rarity: "uncommon"
+        },
+        {
+          id: Achievements.Completionist,
+          title: "Completionist",
+          desc: "Unlock all achievements",
+          icon: "papirus:actions/games-achievements",
+          rarity: "legendary"
+        },
+        {
+          id: Achievements.SetupComplete,
+          title: "Welcome Home",
+          desc: "Finish YukiOS setup wizard",
+          icon: "papirus:actions/flag",
+          rarity: "uncommon"
+        },
+        {
+          id: Achievements.IntroTourComplete,
+          title: "Tour Guide",
+          desc: "Finish the YukiOS intro tour",
+          icon: "papirus:apps/maps",
+          rarity: "rare"
+        },
+        {
+          id: Achievements.FontCustomizer,
+          title: "Font Customizer",
+          desc: "Set a custom TTF font as system font",
+          icon: "papirus:apps/preferences-desktop-font",
+          rarity: "uncommon"
+        },
+        {
+          id: Achievements.WorkspaceWanderer,
+          title: "Workspace Wanderer",
+          desc: "Switch workspaces 10 times",
+          icon: "papirus:apps/utilities-tweak-tool",
+          rarity: "rare"
+        },
+        {
+          id: Achievements.WorkspaceArchitect,
+          title: "Workspace Architect",
+          desc: "Create 3 different workspaces",
+          icon: "papirus:actions/list-add",
+          rarity: "uncommon"
+        },
+        {
+          id: Achievements.MathWhiz,
+          title: "Crunch Time",
+          desc: "Perform 10 calculations in the calculator",
+          icon: "papirus:apps/accessories-calculator",
+          rarity: "uncommon"
+        },
+        {
+          id: Achievements.NightPerson,
+          title: "Night Person",
+          desc: "Enable night mode",
+          icon: "papirus:status/weather-clear-night",
+          rarity: "common"
+        },
+        {
+          id: Achievements.PowerUser,
+          title: "Power Cycle",
+          desc: "Switch power profiles 5 times",
+          icon: "papirus:status/battery-020",
+          rarity: "rare"
+        },
+        {
+          id: Achievements.Customizer,
+          title: "Hotkeyed",
+          desc: "Customize a keyboard shortcut",
+          icon: "papirus:devices/input-keyboard",
+          rarity: "uncommon"
+        },
+        {
+          id: Achievements.Flashback,
+          title: "Flashback",
+          desc: "Play a Flash game",
+          icon: "papirus:mimetypes/video-x-generic",
+          rarity: "common"
+        },
+        {
+          id: Achievements.Converter,
+          title: "Converted",
+          desc: "Convert a file",
+          icon: "papirus:actions/swap-panels",
+          rarity: "common"
+        },
+        {
+          id: Achievements.WidgetAdded,
+          title: "Widget Wizard",
+          desc: "Place your first desktop widget",
+          icon: "papirus:apps/gnome-taquin",
+          rarity: "common"
+        },
+        {
+          id: Achievements.ThemeSmith,
+          title: "Theme Smith",
+          desc: "Save a custom theme",
+          icon: "papirus:apps/com.github.cassidyjames.palette",
+          rarity: "rare"
+        },
+        {
+          id: Achievements.MacroMaker,
+          title: "Macro Maker",
+          desc: "Create a custom shortcut action",
+          icon: "papirus:apps/accessories-dictionary",
+          rarity: "rare"
+        },
+        {
+          id: Achievements.GhostMode,
+          title: "Ghost Mode",
+          desc: "Open an incognito browser window",
+          icon: "papirus:apps/maps",
+          rarity: "rare"
+        },
+        {
+          id: Achievements.PinCushion,
+          title: "Pin Cushion",
+          desc: "Pin an app to the taskbar",
+          icon: "papirus:actions/window-pin",
+          rarity: "common"
+        },
+        {
+          id: Achievements.Sampler,
+          title: "Sampler",
+          desc: "Sample a color with the color picker",
+          icon: "papirus:actions/color-select",
+          rarity: "common"
+        }
+      ];
+    return sharedCatalog;
+  }
+
+  loadFromStorage() {
+    try {
+      const saved = os.storage.get(StorageKeys.achievements);
+      if (saved) {
+        const entries = Array.isArray(saved) ? saved.map((id) => [id, Date.now()]) : Object.entries(saved);
+        const validIds = new Set(this.achievements.map((a) => a.id));
+        this.unlocked = new Map(entries.filter(([id]) => validIds.has(id)));
+      }
+      const savedCounters = os.storage.get(StorageKeys.achievementCounters);
+      if (savedCounters) this.counters = savedCounters;
+    } catch (e) {
+      console.error("[Achievements]", e);
+    }
+  }
+
+  saveToStorage() {
+    try {
+      const obj = {};
+      for (const [id, ts] of this.unlocked) obj[id] = ts;
+      os.storage.set(StorageKeys.achievements, obj);
+      os.storage.set(StorageKeys.achievementCounters, this.counters);
+    } catch (e) {
+      console.error("[Achievements]", e);
+    }
+  }
+
+  renderHero() {
+    const stats = this.getStats();
+    const disabled = parseBool(os.storage.get(StorageKeys.achievementsDisabled));
+
+    return `
+    <div class="achievements-hero">
+      <div class="achievements-hero__bg"></div>
+      <div class="achievements-hero__content">
+        <div class="achievements-hero__icon-wrapper">
+          <img src="https://cdn.jsdelivr.net/gh/PapirusDevelopmentTeam/papirus-icon-theme@master/Papirus/22x22/actions/games-achievements.svg" class="papirus-icon papirus-icon--22" alt="" />
+        </div>
+        <h1 class="achievements-hero__title">Achievements</h1>
+        <p class="achievements-hero__subtitle">Track your progress in YukiOS</p>
+        ${
+          disabled
+            ? `
+          <div class="achievements-disabled-banner">
+            <img src="https://cdn.jsdelivr.net/gh/PapirusDevelopmentTeam/papirus-icon-theme@master/Papirus/22x22/actions/im-ban-user.svg" class="papirus-icon papirus-icon--22" alt="" />
+            Achievements are currently disabled in Settings
+          </div>
+        `
+            : ""
+        }
+      </div>
+      <div class="achievements-hero__stats">
+        <div class="achievements-hero__stat">
+          <div class="achievements-hero__stat-value">${stats.unlocked}</div>
+          <div class="achievements-hero__stat-label">Unlocked</div>
+        </div>
+        <div class="achievements-hero__stat">
+          <div class="achievements-hero__stat-value">${stats.percentage}%</div>
+          <div class="achievements-hero__stat-label">Complete</div>
+        </div>
+        <div class="achievements-hero__stat">
+          <div class="achievements-hero__stat-value">${stats.total - stats.unlocked}</div>
+          <div class="achievements-hero__stat-label">Remaining</div>
+        </div>
+      </div>
+    </div>
+  `;
+  }
+
+  renderGrid(filter) {
+    const disabled = parseBool(os.storage.get(StorageKeys.achievementsDisabled));
+
+    return this.achievements
+      .filter((a) => {
+        if (filter === "unlocked") return this.unlocked.has(a.id);
+        if (filter === "locked") return !this.unlocked.has(a.id);
+        return true;
+      })
+      .map((a) => {
+        const unlocked = this.unlocked.has(a.id);
+        return `
+        <div class="achievement-card ${unlocked ? "achievement-card--unlocked" : ""} ${disabled ? "achievement-card--disabled" : ""}" data-rarity="${a.rarity}">
+          <div class="achievement-card__icon-wrapper">
+            <div class="achievement-card__icon-bg"></div>
+            ${a.icon.startsWith("papirus:") ? `<img src="https://cdn.jsdelivr.net/gh/PapirusDevelopmentTeam/papirus-icon-theme@master/Papirus/22x22/${a.icon.slice(8)}.svg" class="papirus-icon papirus-icon--22 achievement-card__icon" alt="" />` : `<i class="fas ${a.icon} achievement-card__icon"></i>`}
+            ${unlocked ? '<div class="achievement-card__checkmark"><img src="https://cdn.jsdelivr.net/gh/PapirusDevelopmentTeam/papirus-icon-theme@master/Papirus/22x22/actions/object-select.svg" class="papirus-icon papirus-icon--22" alt="" /></div>' : ""}
+          </div>
+          <div class="achievement-card__content">
+            <div class="achievement-card__header">
+              <h3 class="achievement-card__title">${a.title}</h3>
+              <div class="achievement-card__badges">
+                <span class="achievement-card__rarity achievement-card__rarity--${a.rarity}">${a.rarity}</span>
+                ${!unlocked ? '<div class="achievement-card__lock"><img src="https://cdn.jsdelivr.net/gh/PapirusDevelopmentTeam/papirus-icon-theme@master/Papirus/22x22/actions/object-locked.svg" class="papirus-icon papirus-icon--22" alt="" /></div>' : ""}
+              </div>
+            </div>
+            <p class="achievement-card__desc">${a.desc}</p>
+            ${unlocked ? `<p class="achievement-card__date">Unlocked on ${new Date(this.unlocked.get(a.id)).toLocaleDateString()}</p>` : ""}
+          </div>
+        </div>
+      `;
+      })
+      .join("");
+  }
+  renderProgress() {
+    const total = this.achievements.length;
+    const done = this.unlocked.size;
+    const pct = Math.round((done / total) * 100);
+    const disabled = parseBool(os.storage.get(StorageKeys.achievementsDisabled));
+
+    return `
+    <div class="achievements-progress ${disabled ? "achievements-progress--disabled" : ""}">
+      <div class="achievements-progress__header">
+        <span class="achievements-progress__label">Overall Progress</span>
+        <span class="achievements-progress__counter">${done} / ${total}</span>
+      </div>
+      <div class="achievements-progress__bar-wrapper">
+        <div class="achievements-progress__bar">
+          <div class="achievements-progress__fill" style="width: ${pct}%"></div>
+        </div>
+        <span class="achievements-progress__percentage">${pct}%</span>
+      </div>
+    </div>
+  `;
+  }
+
+  renderToggle(current) {
+    const opts = [
+      { val: "all", label: "All", icon: "papirus:actions/view-list" },
+      { val: "unlocked", label: "Unlocked", icon: "papirus:actions/object-select" },
+      { val: "locked", label: "Locked", icon: "papirus:actions/object-locked" }
+    ];
+    return `
+      <div class="achievements-toggle">
+        ${opts
+          .map(
+            (o) => `
+          <button
+            class="achievements-toggle__btn ${current === o.val ? "achievements-toggle__btn--active" : ""}"
+            data-filter="${o.val}"
+          >
+            ${o.icon.startsWith("papirus:") ? `<img src="https://cdn.jsdelivr.net/gh/PapirusDevelopmentTeam/papirus-icon-theme@master/Papirus/22x22/${o.icon.slice(8)}.svg" class="papirus-icon papirus-icon--22" alt="" />` : `<i class="fas ${o.icon}"></i>`}
+            <span>${o.label}</span>
+          </button>
+        `
+          )
+          .join("")}
+      </div>
+    `;
+  }
+
+  setFilter(filter) {
+    this.currentFilter = filter;
+    this.refresh();
+  }
+
+  syncAchievements() {
+    const userId = getLiveUserId();
+    if (!userId || this.unlocked.size === 0) return;
+    if (this.syncTimer) clearTimeout(this.syncTimer);
+    this.syncTimer = setTimeout(() => {
+      this.syncTimer = null;
+      this.flushSync();
+    }, 2000);
+  }
+
+  flushSync() {
+    if (this.syncTimer) {
+      clearTimeout(this.syncTimer);
+      this.syncTimer = null;
+    }
+    const userId = getLiveUserId();
+    if (!userId || this.unlocked.size === 0) return;
+    const entries = Array.from(this.unlocked.entries());
+    reportAchievements(
+      userId,
+      entries.map(([id, unlockedAt]) => ({ id, unlockedAt }))
+    );
+  }
+
+  trigger(achievementKey, skipSound = false) {
+    if (parseBool(os.storage.get(StorageKeys.achievementsDisabled))) return;
+
+    if (!this.achievements.find((a) => a.id === achievementKey)) return;
+    if (this.unlocked.has(achievementKey)) return;
+
+    this.unlocked.set(achievementKey, Date.now());
+    this.saveToStorage();
+    this.syncAchievements();
+    this.queueAchievement(achievementKey, skipSound);
+    this.refresh();
+
+    const nonCompletionist = this.achievements.filter((a) => a.id !== Achievements.Completionist);
+    const allDone = nonCompletionist.every((a) => this.unlocked.has(a.id));
+
+    if (allDone && !this.unlocked.has(Achievements.Completionist)) {
+      setTimeout(() => {
+        this.trigger(Achievements.Completionist);
+      }, 500);
+    }
+  }
+
+  queueAchievement(achievementKey, skipSound = false) {
+    this.achievementQueue.push({
+      achievementKey,
+      skipSound
+    });
+
+    this.processQueue();
+  }
+  processQueue() {
+    if (this.isShowingAchievement || this.achievementQueue.length === 0) {
+      return;
+    }
+
+    this.isShowingAchievement = true;
+
+    const { achievementKey, skipSound } = this.achievementQueue.shift();
+
+    this.showAchievementPopup(achievementKey, skipSound);
+  }
+
+  showAchievementPopup(achievementKey, skipSound = false) {
+    const achievement = this.achievements.find((a) => a.id === achievementKey);
+
+    if (!achievement) {
+      this.isShowingAchievement = false;
+      this.processQueue();
+      return;
+    }
+
+    if (!skipSound) {
+      try {
+        const sounds = [this.s1];
+        const pick = sounds[Math.floor(Math.random() * sounds.length)];
+        pick.currentTime = 0;
+        pick.volume = audioMixer().masterVolume * audioMixer().systemVolume;
+        pick.play();
+      } catch (e) {
+        console.error("[Achievements]", e);
+      }
+    }
+
+    const popup = createElement("div");
+    popup.className = "achievement-popup";
+    popup.setAttribute("data-rarity", achievement.rarity);
+
+    popup.innerHTML = `
+    <div class="achievement-popup__icon-wrapper">
+      <div class="achievement-popup__icon-bg"></div>
+      ${achievement.icon.startsWith("papirus:") ? `<img src="https://cdn.jsdelivr.net/gh/PapirusDevelopmentTeam/papirus-icon-theme@master/Papirus/22x22/${achievement.icon.slice(8)}.svg" class="papirus-icon papirus-icon--22 achievement-popup__icon" alt="" />` : `<i class="fas ${achievement.icon} achievement-popup__icon"></i>`}
+    </div>
+    <div class="achievement-popup__content">
+      <div class="achievement-popup__badge">
+        <img src="https://cdn.jsdelivr.net/gh/PapirusDevelopmentTeam/papirus-icon-theme@master/Papirus/22x22/actions/games-achievements.svg" class="papirus-icon papirus-icon--22" alt="" />
+        Achievement Unlocked
+      </div>
+      <div class="achievement-popup__title">${achievement.title}</div>
+      <div class="achievement-popup__desc">${achievement.desc}</div>
+    </div>
+  `;
+
+    document.body.appendChild(popup);
+
+    const dismissPopup = () => {
+      if (!popup.isConnected) return;
+      popup.remove();
+      this.isShowingAchievement = false;
+      this.processQueue();
+    };
+
+    let hideTimer;
+    popup.addEventListener("click", () => {
+      clearTimeout(hideTimer);
+      dismissPopup();
+      os.app.launch("achievementsApp");
+    });
+
+    setTimeout(() => popup.classList.add("achievement-popup--show"), 10);
+
+    const displayDuration = 4000;
+
+    hideTimer = setTimeout(() => {
+      popup.classList.remove("achievement-popup--show");
+      popup.classList.add("achievement-popup--hide");
+
+      setTimeout(() => {
+        dismissPopup();
+      }, 600);
+    }, displayDuration);
+  }
+
+  showAchievement(achievementKey) {
+    this.queueAchievement(achievementKey);
+  }
+
+  unlock(achievementKey) {
+    this.trigger(achievementKey);
+  }
+
+  isUnlocked(achievementKey) {
+    return this.unlocked.has(achievementKey);
+  }
+
+  refresh() {
+    const win = $("#achievements-yukios");
+    if (!win) return;
+    const scroll = win.querySelector(".achievements-scroll");
+    if (!scroll) return;
+    const filter = this.currentFilter || "all";
+    scroll.innerHTML = `
+      ${this.renderHero()}
+      ${this.renderProgress()}
+      ${this.renderToggle(filter)}
+      <button type="button" class="achievements-unlock-all">
+        <img src="https://cdn.jsdelivr.net/gh/PapirusDevelopmentTeam/papirus-icon-theme@master/Papirus/22x22/actions/bookmark-new.svg" class="papirus-icon papirus-icon--22" alt="" />
+        <span>Unlock All</span>
+      </button>
+      <div class="achievements-grid">
+        ${this.renderGrid(filter)}
+      </div>
+    `;
+  }
+
+  increment(counterKey) {
+    const steps = this.thresholds[counterKey];
+    if (!steps) {
+      this.trigger(counterKey);
+      return;
+    }
+    this.counters[counterKey] = (this.counters[counterKey] || 0) + 1;
+    const count = this.counters[counterKey];
+    for (const step of steps) {
+      if (count === step.at) this.trigger(step.key);
+    }
+    this.saveToStorage();
+  }
+
+  incrementWindowOpen() {
+    const count = $$(".window").length;
+    if (count >= 5) this.trigger(this.thresholds.openWindows[0].key);
+    if (count >= 10) this.trigger(this.thresholds.openWindows[1].key);
+  }
+
+  incrementAppLaunched() {
+    this.increment("appLaunched");
+  }
+  incrementTerminalCmd() {
+    this.increment("terminalCmd");
+  }
+  incrementGameLaunched() {
+    this.increment("gameLaunched");
+  }
+  incrementWallpaper() {
+    this.increment("wallpaper");
+  }
+  incrementFileUploaded() {
+    this.increment("fileUploaded");
+  }
+  incrementSession() {
+    this.increment("session");
+  }
+  incrementCalculationDone() {
+    this.increment("calculationDone");
+  }
+  incrementPowerProfileChange() {
+    this.increment("powerProfileChange");
+  }
+  triggerCommandExecution(command) {
+    this.incrementTerminalCmd();
+    if (command && command.trim().startsWith("git ")) {
+      this.increment("gitCommand");
+    }
+  }
+
+  resetAll() {
+    this.unlocked.clear();
+    this.counters = {};
+    this.achievementQueue = [];
+    this.isShowingAchievement = false;
+    this.saveToStorage();
+    this.refresh();
+  }
+
+  getStats() {
+    return {
+      total: this.achievements.length,
+      unlocked: this.unlocked.size,
+      percentage: Math.round((this.unlocked.size / this.achievements.length) * 100)
+    };
+  }
+
+  unlockAll() {
+    this.achievements.forEach((a) => this.unlocked.set(a.id, Date.now()));
+    this.saveToStorage();
+    this.refresh();
+    this.playFinalConfetti();
+    this.syncAchievements();
+  }
+
+  playFinalConfetti() {
+    const burst = (opts) => confetti({ zIndex: 2147483647, ...opts });
+    const duration = 20000;
+    const interval = 300;
+    const endTime = Date.now() + duration;
+    const timer = setInterval(() => {
+      burst({
+        particleCount: 45,
+        spread: 90,
+        origin: { x: 0.2 + Math.random() * 0.6, y: 0.6 }
+      });
+      if (Date.now() >= endTime) clearInterval(timer);
+    }, interval);
+  }
+}

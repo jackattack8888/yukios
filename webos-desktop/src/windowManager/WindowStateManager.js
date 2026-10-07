@@ -1,0 +1,204 @@
+import { os, $ } from "../framework.js";
+import { BusEvents } from "../core/EventBus.js";
+import { animateWindowClose, animateWindowMinimize, applyFocusGlow, applyZDepthLift } from "./AnimationSystem.js";
+import { getSetting } from "../utils/utils.js";
+
+export class WindowStateManager {
+  constructor(manager) {
+    this.manager = manager;
+  }
+
+  bringToFront(win) {
+    if (!win) return;
+
+    win.getAnimations().forEach((a) => {
+      if (a.id !== "window-state") a.cancel();
+    });
+    win.style.opacity = "";
+    win.style.transform = "";
+    win.style.filter = "";
+    win.style.pointerEvents = "";
+    win.style.animation = "";
+
+    if (win.style.display === "none") {
+      win.style.display = "";
+    }
+
+    const allWins = Array.from(this.manager.openWindows.keys())
+      .map((id) => $("#" + id))
+      .filter(Boolean);
+    allWins.forEach((w) => applyZDepthLift(w, false));
+
+    this.manager.openWindows.forEach(({ taskbarItem }) => taskbarItem.classList.remove("active"));
+
+    const entry = this.manager.openWindows.get(win.id);
+    if (entry?.taskbarItem) {
+      entry.taskbarItem.classList.add("active");
+      entry.taskbarItem.classList.remove("minimized");
+      this.manager.updatePageFavicon(entry.iconValue, entry.title);
+      if (entry.record) entry.record.zIndex = this.manager.zIndexCounter;
+      os.events.emit(BusEvents.WINDOW_FOCUSED, { winId: win.id });
+    }
+
+    applyFocusGlow(win);
+    applyZDepthLift(win, true);
+    win.style.zIndex = this.manager.nextWindowZIndex();
+    win.focus();
+    this.manager.triggerSessionSave();
+  }
+
+  minimizeWindow(win) {
+    const taskbarItem = $(`#taskbar-${win.id}`);
+    if (taskbarItem) {
+      taskbarItem.classList.remove("active");
+      taskbarItem.classList.add("minimized");
+    }
+    const entry = this.manager.openWindows.get(win.id);
+    if (entry?.record) entry.record.minimized = true;
+    animateWindowMinimize(win, () => {
+      win.style.pointerEvents = "";
+      win.style.animation = "";
+      win.style.transform = "";
+      win.style.opacity = "";
+      if (entry?.record?.minimized) win.style.display = "none";
+    });
+    this.manager.triggerSessionSave();
+  }
+
+  toggleFullscreen(win) {
+    const wasFullscreen = win.dataset.fullscreen === "true";
+    const header = win.querySelector(".window-header");
+
+    if (wasFullscreen) {
+      if (document.fullscreenElement === win || document.fullscreenElement === document.documentElement) {
+        document.exitFullscreen();
+      }
+
+      Object.assign(win.style, {
+        width: win.dataset.prevWidth,
+        height: win.dataset.prevHeight,
+        left: win.dataset.prevLeft,
+        top: win.dataset.prevTop,
+        zIndex: win.dataset.prevZIndex || win.style.zIndex
+      });
+
+      if (header) header.style.display = "";
+      win.dataset.fullscreen = "false";
+      const entry = this.manager.openWindows.get(win.id);
+      if (entry?.record) entry.record.fullscreen = false;
+    } else {
+      Object.assign(win.dataset, {
+        prevWidth: win.style.width,
+        prevHeight: win.style.height,
+        prevLeft: win.style.left,
+        prevTop: win.style.top,
+        prevZIndex: win.style.zIndex
+      });
+
+      const overFullscreen = getSetting("notificationsOverFullscreen", false) === true;
+
+      const makeFullscreen = () => {
+        Object.assign(win.style, {
+          width: "100vw",
+          height: "100vh",
+          left: "0",
+          top: "0",
+          zIndex: overFullscreen ? "99999" : win.style.zIndex
+        });
+        if (header) header.style.display = "none";
+      };
+
+      if (overFullscreen) {
+        if (document.documentElement.requestFullscreen) {
+          document.documentElement.requestFullscreen().then(makeFullscreen).catch(makeFullscreen);
+        } else {
+          makeFullscreen();
+        }
+      } else {
+        if (win.requestFullscreen) {
+          win.requestFullscreen().then(makeFullscreen).catch(makeFullscreen);
+        } else {
+          makeFullscreen();
+        }
+      }
+
+      win.dataset.fullscreen = "true";
+      const entry = this.manager.openWindows.get(win.id);
+      if (entry?.record) entry.record.fullscreen = true;
+
+      const onFullscreenChange = () => {
+        if (!document.fullscreenElement) {
+          if (header) header.style.display = "";
+          Object.assign(win.style, {
+            width: win.dataset.prevWidth || win.style.width,
+            height: win.dataset.prevHeight || win.style.height,
+            left: win.dataset.prevLeft || win.style.left,
+            top: win.dataset.prevTop || win.style.top,
+            zIndex: win.dataset.prevZIndex || win.style.zIndex
+          });
+          win.dataset.fullscreen = "false";
+          const entry = this.manager.openWindows.get(win.id);
+          if (entry?.record) entry.record.fullscreen = false;
+          document.removeEventListener("fullscreenchange", onFullscreenChange);
+        }
+      };
+
+      document.addEventListener("fullscreenchange", onFullscreenChange);
+    }
+    this.manager.triggerSessionSave();
+  }
+
+  closeAll() {
+    const winIds = Array.from(this.manager.openWindows.keys());
+    for (const winId of winIds) {
+      const win = $("#" + winId);
+      if (win) {
+        this.silenceWindow(win);
+        try {
+          win.dispatchEvent(new Event("remove"));
+        } catch {}
+        win.remove();
+      }
+      this.manager.removeFromTaskbar(winId);
+    }
+    this.manager.triggerSessionSave();
+  }
+
+  silenceWindow(win) {
+    const iframes = win.querySelectorAll("iframe");
+    iframes.forEach((iframe) => {
+      try {
+        iframe.src = "about:blank";
+        iframe.remove();
+      } catch (e) {
+        iframe.src = "about:blank";
+      }
+    });
+
+    const media = win.querySelectorAll("video, audio");
+    media.forEach((m) => {
+      m.pause();
+      m.src = "";
+      m.load();
+      m.remove();
+    });
+  }
+
+  animateAndRemove(win) {
+    animateWindowClose(win, () => {
+      try {
+        win.dispatchEvent(new Event("remove"));
+      } catch {}
+      win.remove();
+    });
+    this.manager.triggerSessionSave();
+  }
+
+  registerCloseWindow(closeButton, winId) {
+    closeButton.addEventListener("click", () => {
+      const win = $("#" + winId);
+      if (!win) return;
+      this.manager.closeWindow(win);
+    });
+  }
+}

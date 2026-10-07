@@ -1,0 +1,2244 @@
+import { appMap } from "../games/gamesList.js";
+import { APP_DESCRIPTIONS, descriptionMap } from "../games/gameDescriptions.js";
+import { camelize } from "../utils/utils.js";
+import { ClippyAnimation, speak } from "../ai/clippy.js";
+import { isImageFile, resolveFileIcon, openFileWith, showFileProperties } from "../fileDisplay.js";
+import { isTextFile } from "../utils/utils.js";
+import { resolveIconUrl } from "../shared/assetResolver.js";
+import { showDynamicContextMenu, refreshIcons } from "../shared/contextMenu.js";
+import { getEffectiveIcon } from "../shared/iconPack.js";
+import { START_CATEGORY_ICONS } from "../registry/CategoryIcons.js";
+import { CDN_CONFIG } from "../shared/cdnConfig.js";
+import { getAppRegistry } from "../appRegistry.js";
+import { SYSTEM_APPS } from "../AppRegistryConfig.js";
+import { resolveAvatarUrl } from "../social/avatarResolver.js";
+import { SETTINGS_CATEGORIES, launchSettingsPane } from "../settings/settingsNav.js";
+import { addAppToDesktop, isAppOnDesktop } from "../shared/desktopShortcuts.js";
+import { isAppPinnedToTaskbar, toggleTaskbarPin, showAppProperties } from "../shared/appContextActions.js";
+
+import {
+  $,
+  $$,
+  createElement,
+  setHTML,
+  setText,
+  addClass,
+  removeClass,
+  toggleClass,
+  setStyle
+} from "../shared/domUtils.js";
+import { BusEvents } from "../core/EventBus.js";
+import { StorageKeys, os, ServiceKeys } from "../framework.js";
+import { KeybindManager } from "../keybindManager.js";
+import { modeManager, MODES } from "../modeManager.js";
+import { isIntroTourKeepingStartMenuOpen } from "../apps/introTour.js";
+function getStartMenuEl() {
+  return $("#start-menu") || $(".start-menu");
+}
+
+export function isStartMenuBlocked() {
+  if ($("#session-overlay")) return true;
+  const sessionManager = os.app.getInstance(ServiceKeys.SESSION_MANAGER);
+  if (sessionManager?.isLocked) return true;
+  if (!sessionManager?.currentSession) return true;
+  return false;
+}
+
+let descriptionTooltip = null;
+const fileContentCache = new Map();
+
+function showDescriptionTooltip(text, x, y) {
+  if (descriptionTooltip) {
+    document.body.removeChild(descriptionTooltip);
+  }
+
+  descriptionTooltip = createElement("div", { className: "description-tooltip", text });
+  setStyle(descriptionTooltip, { left: `${x + 10}px`, top: `${y + 10}px` });
+  document.body.appendChild(descriptionTooltip);
+}
+
+function hideDescriptionTooltip() {
+  if (descriptionTooltip) {
+    document.body.removeChild(descriptionTooltip);
+    descriptionTooltip = null;
+  }
+}
+
+function isStartMenuOpen() {
+  const el = getStartMenuEl();
+  return !!el && el.style.display === "flex";
+}
+
+export function closeStartMenu() {
+  if (isIntroTourKeepingStartMenuOpen()) return;
+  const el = getStartMenuEl();
+  if (!el) return;
+  if (el.style.display !== "flex") return;
+
+  clearSelection();
+
+  el.classList.add("closing");
+  el.addEventListener(
+    "animationend",
+    () => {
+      el.classList.remove("closing");
+      el.style.display = "none";
+    },
+    { once: true }
+  );
+}
+
+export function applyStartMenuSettings(el) {
+  if (!el) return;
+  ensureStartMenuStructure(el);
+  const width = os.storage.get(StorageKeys.startMenuWidth) || "650";
+  const height = os.storage.get(StorageKeys.startMenuHeight) || "500";
+  el.style.width = `${width}px`;
+  el.style.height = `${height}px`;
+
+  const catsData = os.storage.get(StorageKeys.startMenuCats);
+  let cats = {};
+  if (catsData) {
+    try {
+      cats = catsData;
+    } catch (e) {
+      console.error("[StartMenu]", e);
+    }
+  }
+  const staticCatNames = [
+    "favorites",
+    "recent",
+    "menu",
+    WEB_MENU_CATEGORY,
+    "internet",
+    "media",
+    "office",
+    "graphics",
+    "development",
+    "games",
+    "system",
+    "help"
+  ];
+  const el2 = el.querySelector('.start-cat[data-cat="places"]');
+  if (el2) el2.style.display = "none";
+  const deletedCats = getCategoryDeleted();
+  staticCatNames.forEach((catName) => {
+    const isEnabled = cats[catName] !== false;
+    const catEl =
+      catName === "menu"
+        ? el.querySelector('.start-cat[data-cat="all"]')
+        : el.querySelector(`.start-cat[data-cat="${catName}"]`);
+    if (catEl) {
+      catEl.style.display = deletedCats.has(catName) ? "none" : isEnabled ? "flex" : "none";
+    }
+  });
+
+  const renames = getCategoryRenames();
+  $$(".start-cat", el).forEach((catEl) => {
+    const cName = catEl.dataset.cat;
+    if (cName && renames[cName]) {
+      const textNode = catEl.childNodes[catEl.childNodes.length - 1];
+      if (textNode) textNode.textContent = ` ${renames[cName]}`;
+    }
+  });
+}
+
+async function openStartMenu({ focusSearch = false, openDefaultPage = true } = {}) {
+  if (isStartMenuBlocked()) return;
+  if (os.tiling.enabled) return;
+  if (modeManager.isActive(MODES.CHROME_OS)) {
+    const { getLauncher } = await import("../chromeos/Launcher.js");
+    getLauncher().open();
+    return;
+  }
+  const el = getStartMenuEl();
+  if (!el) return;
+
+  ensureStartMenuStructure(el);
+  applyStartMenuSettings(el);
+
+  el.classList.remove("closing");
+  el.style.display = "flex";
+  focusMode = "categories";
+  clearSelection();
+  const appsSig = computeAppsSignature();
+  if (appsSig !== appsSignature) {
+    appsSignature = appsSig;
+    renderedCategories.clear();
+  }
+  updateFavoritesUI();
+
+  ["all", "system", "games"].forEach((cat) => {
+    if (!renderedCategories.has(cat)) {
+      populateCategoryPage(cat);
+      renderedCategories.add(cat);
+    }
+  });
+
+  if (openDefaultPage) {
+    const catsData = os.storage.get(StorageKeys.startMenuCats);
+    let cats = {};
+    if (catsData) {
+      try {
+        cats = catsData;
+      } catch (e) {
+        console.error("[StartMenu]", e);
+      }
+    }
+    const deletedCats = getCategoryDeleted();
+    let defaultCat = "favorites";
+    if (cats.favorites === false || deletedCats.has("favorites")) {
+      const catNames = ["all", WEB_MENU_CATEGORY, "favorites", "games", "system", "help", "settingsApp"];
+      const firstEnabled = catNames.find((c) => cats[c] !== false && !deletedCats.has(c));
+      if (firstEnabled) defaultCat = firstEnabled;
+    }
+    el.querySelector(`.start-cat[data-cat="${defaultCat}"]`)?.click();
+  }
+
+  if (focusSearch) {
+    $("#start-menu-search")?.focus?.();
+  }
+}
+
+export async function toggleStartMenu(opts) {
+  if (isStartMenuOpen()) closeStartMenu();
+  else await openStartMenu(opts);
+}
+
+function getFavorites() {
+  if (favoritesCache !== null) return favoritesCache;
+  favoritesCache = os.storage.get(StorageKeys.favoritesKey) || [];
+  return favoritesCache;
+}
+
+function saveFavorites(favorites) {
+  favoritesCache = favorites;
+  os.storage.set(StorageKeys.favoritesKey, favorites);
+}
+
+function favoriteApp(appName) {
+  let favorites = getFavorites();
+  if (!favorites.includes(appName)) {
+    favorites.push(appName);
+    saveFavorites(favorites);
+    updateFavoritesUI();
+    updateStarState(appName, true);
+    speak("Nice pick, I like that one too!", ClippyAnimation.Show);
+  }
+}
+
+function unfavoriteApp(appName) {
+  let favorites = getFavorites();
+  favorites = favorites.filter((name) => name !== appName);
+  saveFavorites(favorites);
+  updateFavoritesUI();
+  updateStarState(appName, false);
+}
+
+function buildIconEl(iconVal) {
+  const effective = getEffectiveIcon(iconVal);
+  const isPapirus = typeof effective === "string" && effective.startsWith("papirus:");
+  if (isPapirus) {
+    const iconEl = createElement("img");
+    iconEl.src = resolveIconUrl(effective);
+    iconEl.alt = "";
+    iconEl.loading = "lazy";
+    iconEl.className = "papirus-icon papirus-icon--22";
+    return iconEl;
+  }
+  const isImage =
+    typeof effective === "string" &&
+    (isImageFile(effective) ||
+      effective.startsWith("http") ||
+      effective.startsWith("data:") ||
+      effective.startsWith("blob:") ||
+      effective.startsWith("/"));
+  if (isImage) {
+    const iconEl = createElement("img");
+    let iconSrc = effective;
+    if (effective.startsWith("static/") || effective.startsWith("/static/")) {
+      const cleanPath = effective.startsWith("/") ? effective.substring(1) : effective;
+      iconSrc = `${CDN_CONFIG.repos.main.base}/${cleanPath}`;
+    } else {
+      iconSrc = resolveIconUrl(effective);
+    }
+    iconEl.src = iconSrc;
+    iconEl.alt = "";
+    iconEl.loading = "lazy";
+    return iconEl;
+  }
+  const iconEl = createElement("i");
+  iconEl.className = typeof effective === "string" && effective.startsWith("fa") ? effective : `fa ${effective}`;
+  return iconEl;
+}
+
+function createStarButton(appName) {
+  const btn = createElement("span");
+  btn.textContent = "★";
+  btn.className = "star";
+  btn.style.color = getFavorites().includes(appName) ? "var(--brand)" : "#ccc";
+
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (getFavorites().includes(appName)) {
+      unfavoriteApp(appName);
+    } else {
+      favoriteApp(appName);
+    }
+  });
+
+  btn.dataset.app = appName;
+  return btn;
+}
+
+function updateStarState(appName, isFavorite) {
+  $$(`.start-menu-item[data-app="${appName}"] span`).forEach((star) => {
+    if (star.textContent === "★") {
+      star.style.color = isFavorite ? "var(--brand)" : "#ccc";
+    }
+  });
+  const item = $(`.start-menu-item[data-app="${appName}"]`);
+  if (item) {
+    item.style.background = isFavorite ? "rgba(255, 215, 0, 0.1)" : "transparent";
+  }
+}
+let selectedItem = null;
+let selectedCategory = null;
+let keyboardHandlerInstalled = false;
+let focusMode = "apps";
+let favoritesCache = null;
+const renderedCategories = new Set();
+let searchDebounceTimer = null;
+
+const RECENTLY_USED_MAX = 8;
+const CORE_MENU_CATEGORY = "all";
+const WEB_MENU_CATEGORY = "web";
+const WEB_CATEGORY_ORDER = ["internet", "media", "office", "graphics", "development"];
+const WEB_CATEGORY_LABELS = {
+  internet: "Internet",
+  media: "Media",
+  office: "Office",
+  graphics: "Graphics",
+  development: "Development"
+};
+
+let mergedAllAppsCache = null;
+let mergedAllAppsSig = "";
+let appsSignature = "";
+let searchIndexCache = null;
+let searchIndexSig = "";
+
+function computeAppsSignature() {
+  const appRegistry = getAppRegistry();
+  const renamed = Object.entries(appRegistry.renamedApps)
+    .map(([key, value]) => key + "=" + value)
+    .join(",");
+  return [
+    Object.keys(appMap).length,
+    Object.keys(os.app.getAllApps()).length,
+    appRegistry.disabledApps.size,
+    appRegistry.uninstalledApps.size,
+    renamed
+  ].join("|");
+}
+
+function getAllAppsMerged() {
+  const sig = computeAppsSignature();
+  if (!mergedAllAppsCache || sig !== mergedAllAppsSig) {
+    mergedAllAppsSig = sig;
+    mergedAllAppsCache = { ...appMap, ...os.app.getAllApps() };
+  }
+  return mergedAllAppsCache;
+}
+
+function getSearchIndex() {
+  const sig = computeAppsSignature();
+  if (searchIndexCache && sig === searchIndexSig) return searchIndexCache;
+  searchIndexSig = sig;
+  const appRegistry = getAppRegistry();
+  const index = [];
+  for (const [appId, appData] of Object.entries(getAllAppsMerged())) {
+    if (appRegistry.isAppUninstalled(appId) || appRegistry.isAppDisabled(appId)) continue;
+    index.push({
+      appId,
+      appData,
+      titleLower: (appData.title || appId).toLowerCase(),
+      descLower: (APP_DESCRIPTIONS[appId] || descriptionMap[appId] || "").toLowerCase(),
+      isWeb: isWebApp(appId, appData),
+      isGame: appData.type === "game"
+    });
+  }
+  searchIndexCache = index;
+  return index;
+}
+
+function getAppCategory(appId, appData) {
+  return appData.category || SYSTEM_APPS[appId]?.category || "system";
+}
+
+function isWebApp(appId, appData) {
+  if (appData.launchType === "iframe" || appData.launchType === "remote") return true;
+  if (appData.source || appData.targetUrl) return true;
+  return false;
+}
+
+function isCoreApp(appId, appData) {
+  return appData.type === "system" && !isWebApp(appId, appData);
+}
+
+function buildCategoryEl(cat, label) {
+  const papirusIcon = START_CATEGORY_ICONS[cat] || "papirus:actions/bookmark-new";
+  const effective = getEffectiveIcon(papirusIcon);
+  const el = createElement("div");
+  el.className = "start-cat";
+  el.dataset.cat = cat;
+  if (typeof effective === "string" && effective.startsWith("papirus:")) {
+    const img = createElement("img");
+    img.src = resolveIconUrl(effective);
+    img.className = "papirus-icon papirus-icon--22";
+    img.alt = "";
+    el.appendChild(img);
+  } else {
+    const icon = createElement("i");
+    icon.className = effective;
+    el.appendChild(icon);
+  }
+  el.appendChild(document.createTextNode(` ${label}`));
+  return el;
+}
+
+function ensureStartMenuStructure(menuEl) {
+  if (!menuEl) return;
+
+  const catList = $(".start-cat-list", menuEl);
+  const content = $(".start-content", menuEl);
+  if (!catList || !content) return;
+
+  const allCat = $('.start-cat[data-cat="all"]', menuEl);
+  if (allCat) allCat.dataset.cat = "all";
+
+  const allPage = $('.start-page[data-page="all"]', menuEl);
+  if (allPage) allPage.dataset.page = "all";
+
+  const catLabels = {
+    favorites: "Favorites",
+    recent: "Recent",
+    all: "All Applications",
+    internet: "Internet",
+    media: "Media",
+    office: "Office",
+    graphics: "Graphics",
+    games: "Games",
+    development: "Development",
+    system: "System",
+    help: "Help",
+    places: "Places"
+  };
+
+  for (const [cat, papirusIcon] of Object.entries(START_CATEGORY_ICONS)) {
+    const label = catLabels[cat] || cat.charAt(0).toUpperCase() + cat.slice(1);
+    let catEl = catList.querySelector(`.start-cat[data-cat="${cat}"]`);
+    if (catEl) {
+      const effective = getEffectiveIcon(papirusIcon);
+      catEl.querySelectorAll("img, i, svg").forEach((el) => el.remove());
+      let newIcon;
+      if (typeof effective === "string" && effective.startsWith("papirus:")) {
+        newIcon = createElement("img");
+        newIcon.src = resolveIconUrl(effective);
+        newIcon.className = "papirus-icon papirus-icon--22";
+        newIcon.alt = "";
+      } else {
+        newIcon = createElement("i");
+        newIcon.className = effective;
+      }
+      catEl.prepend(newIcon);
+    } else {
+      catEl = buildCategoryEl(cat, label);
+      const order = Object.keys(START_CATEGORY_ICONS);
+      const idx = order.indexOf(cat);
+      let inserted = false;
+      for (let j = idx + 1; j < order.length; j++) {
+        const nextCat = order[j];
+        const nextEl = catList.querySelector(`.start-cat[data-cat="${nextCat}"]`);
+        if (nextEl) {
+          catList.insertBefore(catEl, nextEl);
+          inserted = true;
+          break;
+        }
+      }
+      if (!inserted) catList.appendChild(catEl);
+      catEl.onclick = () => {
+        const catName = catEl.dataset.cat;
+        if (catName === "settingsApp") {
+          os.app.launch("settingsApp");
+          return;
+        }
+        activateCategoryPage(catEl);
+      };
+      catEl.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        showCategoryContextMenu(e, catEl);
+      });
+    }
+  }
+
+  const settingsCat = menuEl.querySelector('.start-cat[data-cat="settingsApp"]');
+  if (settingsCat) {
+    const effective = getEffectiveIcon("papirus:actions/configure");
+    settingsCat.querySelectorAll("img, i, svg").forEach((el) => el.remove());
+    let newIcon;
+    if (typeof effective === "string" && effective.startsWith("papirus:")) {
+      newIcon = createElement("img");
+      newIcon.src = resolveIconUrl(effective);
+      newIcon.className = "papirus-icon papirus-icon--22";
+      newIcon.alt = "";
+    } else {
+      newIcon = createElement("i");
+      newIcon.className = effective;
+    }
+    settingsCat.prepend(newIcon);
+  }
+
+  let webCat = $('.start-cat[data-cat="web"]', menuEl);
+  const webPapirus = START_CATEGORY_ICONS.web || "papirus:apps/internet-web-browser";
+  const webEffective = getEffectiveIcon(webPapirus);
+  if (!webCat) {
+    webCat = createElement("div");
+    webCat.className = "start-cat";
+    webCat.dataset.cat = WEB_MENU_CATEGORY;
+    if (typeof webEffective === "string" && webEffective.startsWith("papirus:")) {
+      const icon = createElement("img");
+      icon.src = resolveIconUrl(webEffective);
+      icon.className = "papirus-icon papirus-icon--22";
+      icon.alt = "";
+      webCat.appendChild(icon);
+    } else {
+      const icon = createElement("i");
+      icon.className = webEffective;
+      webCat.appendChild(icon);
+    }
+    webCat.appendChild(document.createTextNode(" Web Apps"));
+    const gamesCat = $('.start-cat[data-cat="games"]', menuEl);
+    if (gamesCat) {
+      catList.insertBefore(webCat, gamesCat);
+    } else {
+      catList.appendChild(webCat);
+    }
+    webCat.onclick = () => activateCategoryPage(webCat);
+    webCat.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      showCategoryContextMenu(e, webCat);
+    });
+  } else {
+    webCat.querySelectorAll("img, i, svg").forEach((el) => el.remove());
+    let newIcon;
+    if (typeof webEffective === "string" && webEffective.startsWith("papirus:")) {
+      newIcon = createElement("img");
+      newIcon.src = resolveIconUrl(webEffective);
+      newIcon.className = "papirus-icon papirus-icon--22";
+      newIcon.alt = "";
+    } else {
+      newIcon = createElement("i");
+      newIcon.className = webEffective;
+    }
+    webCat.prepend(newIcon);
+  }
+
+  let webPage = $('.start-page[data-page="web"]', menuEl);
+  if (!webPage) {
+    webPage = createElement("div");
+    webPage.className = "start-page";
+    webPage.dataset.page = WEB_MENU_CATEGORY;
+
+    const grid = createElement("div");
+    grid.className = "app-grid";
+    webPage.appendChild(grid);
+
+    const recentPage = $('.start-page[data-page="recent"]', menuEl);
+    if (recentPage) {
+      content.insertBefore(webPage, recentPage);
+    } else {
+      content.appendChild(webPage);
+    }
+  }
+}
+
+let startMenuIconPackListenerInstalled = false;
+function ensureStartMenuIconPackListener() {
+  if (startMenuIconPackListenerInstalled) return;
+  startMenuIconPackListenerInstalled = true;
+  os.events.on("icon-pack-changed", () => {
+    const menuEl = getStartMenuEl();
+    if (menuEl) ensureStartMenuStructure(menuEl);
+  });
+}
+ensureStartMenuIconPackListener();
+
+function getRecentlyUsed() {
+  const val = os.storage.get(StorageKeys.recentlyUsedApps);
+  return Array.isArray(val) ? val : [];
+}
+
+export function trackRecentlyUsed(appId) {
+  let recent = getRecentlyUsed();
+  recent = recent.filter((id) => id !== appId);
+  recent.unshift(appId);
+  if (recent.length > RECENTLY_USED_MAX) recent = recent.slice(0, RECENTLY_USED_MAX);
+  os.storage.set(StorageKeys.recentlyUsedApps, recent);
+}
+
+const PROTECTED_CATEGORIES = new Set(["all", "favorites", "recent"]);
+
+function getCategoryRenames() {
+  try {
+    return os.storage.get(StorageKeys.startMenuCategoryRenames) || {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function setCategoryRename(catName, newLabel) {
+  const renames = getCategoryRenames();
+  if (newLabel && newLabel.trim()) {
+    renames[catName] = newLabel.trim();
+  } else {
+    delete renames[catName];
+  }
+  os.storage.set(StorageKeys.startMenuCategoryRenames, renames);
+}
+
+function getCategoryDeleted() {
+  try {
+    return new Set(os.storage.get(StorageKeys.startMenuCategoryDeleted) || []);
+  } catch (e) {
+    return new Set();
+  }
+}
+
+function setCategoryDeleted(catName, deleted) {
+  const deletedSet = getCategoryDeleted();
+  if (deleted) {
+    deletedSet.add(catName);
+  } else {
+    deletedSet.delete(catName);
+  }
+  os.storage.set(StorageKeys.startMenuCategoryDeleted, [...deletedSet]);
+}
+
+function createRecentAppItem(appId, appData) {
+  const item = createElement("div");
+  item.className = "recent-item";
+  item.dataset.app = appId;
+  item.appendChild(buildIconEl(appData.icon || "papirus:actions/bookmark-new"));
+  const content = createElement("div");
+  content.className = "app-content";
+  const title = createElement("span");
+  title.className = "app-title";
+  title.textContent = appData.title || appId;
+  content.appendChild(title);
+  const desc = createElement("span");
+  desc.className = "app-description";
+  desc.textContent = APP_DESCRIPTIONS[appId] || descriptionMap[appId] || "";
+  content.appendChild(desc);
+  item.appendChild(content);
+  item.addEventListener("click", () => {
+    trackRecentlyUsed(appId);
+    os.app.launch(appId);
+    closeStartMenu();
+  });
+  return item;
+}
+
+function createRecentFileItem(name, path, kind) {
+  const item = createElement("div");
+  item.className = "recent-item";
+  item.dataset.fileName = name;
+  item.dataset.filePath = path;
+
+  const rawIcon = resolveFileIcon(name);
+  let iconSrc = rawIcon;
+  if (rawIcon === "@content" || rawIcon === "rom") {
+    iconSrc = "static/icons/file.webp";
+  }
+  const iconEl = buildIconEl(iconSrc);
+
+  const content = createElement("div");
+  content.className = "app-content";
+  const title = createElement("span");
+  title.className = "app-title";
+  title.textContent = name;
+  const desc = createElement("span");
+  desc.className = "app-description";
+  desc.textContent = path;
+
+  content.appendChild(title);
+  content.appendChild(desc);
+  item.appendChild(iconEl);
+  item.appendChild(content);
+
+  item.addEventListener("click", () => {
+    closeStartMenu();
+    const dir = path.split("/").filter(Boolean);
+    openFileWith({ name, path: dir });
+  });
+
+  return item;
+}
+
+function updateRecentlyUsedUI() {
+  const page = $('.start-page[data-page="recent"]');
+  if (!page) return;
+  const wasActive = page.classList.contains("active");
+  page.className = "start-page recent-page";
+  if (wasActive) page.classList.add("active");
+  page.innerHTML = "";
+
+  const header = createElement("div");
+  header.className = "recent-page-header";
+  header.innerHTML = "<span>Recent</span>";
+
+  const clearBtn = createElement("button");
+  clearBtn.className = "recent-clear-btn";
+  clearBtn.textContent = "Clear";
+  clearBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    os.storage.set(StorageKeys.recentFiles, []);
+    os.storage.set(StorageKeys.recentlyUsedApps, []);
+    updateRecentlyUsedUI();
+  });
+  header.appendChild(clearBtn);
+  page.appendChild(header);
+
+  const recentFiles = os.storage.get(StorageKeys.recentFiles) || [];
+
+  if (recentFiles.length > 0) {
+    const filesHeader = createElement("div");
+    filesHeader.className = "recent-section-header";
+    filesHeader.textContent = "Recent Files";
+    page.appendChild(filesHeader);
+    recentFiles.forEach((f) => {
+      page.appendChild(createRecentFileItem(f.name, f.path, f.kind));
+    });
+  }
+
+  const appRegistry = getAppRegistry();
+  const allApps = getAllAppsMerged();
+  const recentApps = getRecentlyUsed();
+  const validApps = recentApps.filter((appId) => {
+    const appData = allApps[appId];
+    if (!appData) return false;
+    if (appRegistry.isAppUninstalled(appId) || appRegistry.isAppDisabled(appId)) return false;
+    return true;
+  });
+
+  if (validApps.length > 0) {
+    const appsHeader = createElement("div");
+    appsHeader.className = "recent-section-header";
+    appsHeader.textContent = "Recent Apps";
+    page.appendChild(appsHeader);
+    validApps.forEach((appId) => {
+      page.appendChild(createRecentAppItem(appId, allApps[appId]));
+    });
+  }
+
+  if (recentFiles.length === 0 && validApps.length === 0) {
+    const empty = createElement("div");
+    empty.className = "recent-empty";
+    empty.textContent = "No recently used items";
+    page.appendChild(empty);
+  }
+}
+
+function clearItemSelection() {
+  if (selectedItem) {
+    selectedItem.classList.remove("selected");
+    selectedItem = null;
+  }
+}
+
+function clearCategorySelection() {
+  if (selectedCategory) {
+    selectedCategory.classList.remove("keyboard-selected");
+    selectedCategory = null;
+  }
+}
+
+function clearSelection() {
+  clearItemSelection();
+  clearCategorySelection();
+}
+
+function selectFirstItemInPage(page) {
+  clearItemSelection();
+  const firstItem = $(".start-menu-item:not(.letter-category-header)", page);
+  if (firstItem) {
+    selectedItem = firstItem;
+    selectedItem.classList.add("selected");
+  }
+}
+
+function focusSearch() {
+  clearSelection();
+  focusMode = "search";
+  $("#start-menu-search")?.focus();
+}
+
+function navigateSelection(direction) {
+  const activePage = $(".start-page.active");
+  if (!activePage) return;
+
+  const items = Array.from(activePage.querySelectorAll(".start-menu-item:not(.letter-category-header)"));
+  if (items.length === 0) return;
+
+  const currentIndex = items.indexOf(selectedItem);
+
+  if (direction === "up" && currentIndex <= 0) {
+    focusSearch();
+    return;
+  }
+
+  let newIndex;
+  if (direction === "down") {
+    newIndex = currentIndex === -1 ? 0 : Math.min(currentIndex + 1, items.length - 1);
+  } else {
+    newIndex = currentIndex === -1 ? items.length - 1 : Math.max(currentIndex - 1, 0);
+  }
+
+  clearItemSelection();
+  selectedItem = items[newIndex];
+  selectedItem.classList.add("selected");
+  selectedItem.scrollIntoView({ block: "nearest" });
+}
+
+function activateCategoryPage(cat) {
+  $$(".start-cat").forEach((c) => c.classList.remove("active"));
+  $$(".start-page").forEach((p) => p.classList.remove("active"));
+  cat.classList.add("active");
+  const page = $(`.start-page[data-page="${cat.dataset.cat}"]`);
+  if (!page) return;
+  page.classList.add("active");
+  if (cat.dataset.cat === "favorites") {
+    updateFavoritesUI();
+  } else if (cat.dataset.cat === "recent") {
+    updateRecentlyUsedUI();
+  } else if (
+    [
+      "all",
+      WEB_MENU_CATEGORY,
+      "internet",
+      "media",
+      "office",
+      "graphics",
+      "games",
+      "development",
+      "system",
+      "help"
+    ].includes(cat.dataset.cat)
+  ) {
+    if (!renderedCategories.has(cat.dataset.cat)) {
+      populateCategoryPage(cat.dataset.cat);
+      renderedCategories.add(cat.dataset.cat);
+    }
+  }
+  selectFirstItemInPage(page);
+}
+
+function navigateCategories(direction) {
+  const categories = Array.from($$(".start-cat:not(.docked)")).filter(
+    (cat) => cat.style.display !== "none" && cat.offsetParent !== null
+  );
+  if (categories.length === 0) return;
+
+  const currentIndex = categories.indexOf(selectedCategory);
+
+  if (direction === "up" && currentIndex <= 0) {
+    focusSearch();
+    return;
+  }
+
+  let newIndex;
+  if (direction === "down") {
+    newIndex = currentIndex === -1 ? 0 : Math.min(currentIndex + 1, categories.length - 1);
+  } else {
+    newIndex = currentIndex === -1 ? categories.length - 1 : Math.max(currentIndex - 1, 0);
+  }
+
+  clearCategorySelection();
+  clearItemSelection();
+  selectedCategory = categories[newIndex];
+  selectedCategory.classList.add("keyboard-selected");
+  selectedCategory.scrollIntoView({ block: "nearest" });
+
+  const catName = selectedCategory.dataset.cat;
+  if (catName !== "settingsApp") {
+    activateCategoryPage(selectedCategory);
+  }
+}
+
+function switchFocusMode(mode) {
+  if (focusMode === mode) return;
+  focusMode = mode;
+
+  if (mode === "categories") {
+    clearItemSelection();
+    const activeCat = $(".start-cat.active");
+    if (activeCat) {
+      clearCategorySelection();
+      selectedCategory = activeCat;
+      selectedCategory.classList.add("keyboard-selected");
+    } else {
+      clearCategorySelection();
+      navigateCategories("down");
+    }
+  } else {
+    clearCategorySelection();
+    const activePage = $(".start-page.active");
+    if (activePage) {
+      selectFirstItemInPage(activePage);
+    }
+  }
+}
+
+function launchSelectedItem() {
+  if (selectedItem) {
+    selectedItem.click();
+  }
+}
+
+export function updateFavoritesUI() {
+  const favoritesPage = $('.start-page[data-page="favorites"]');
+  favoritesPage.innerHTML = "";
+  const favorites = getFavorites();
+
+  if (favorites.length === 0) {
+    return;
+  }
+
+  const appRegistry = getAppRegistry();
+  const allApps = getAllAppsMerged();
+
+  favorites.forEach((appName) => {
+    const appData = allApps[appName];
+    if (!appData) return;
+    if (appRegistry.isAppUninstalled(appName) || appRegistry.isAppDisabled(appName)) return;
+    const item = createAppItem(appName, appData);
+    item.style.background = "rgba(255, 215, 0, 0.1)";
+    favoritesPage.appendChild(item);
+  });
+}
+
+export function setupStartMenu(sessionManager) {
+  const menuEl = $("#start-menu") || $(".start-menu");
+  if (menuEl) {
+    applyStartMenuSettings(menuEl);
+  }
+  $(".start-menu")?.addEventListener("contextmenu", (e) => e.preventDefault());
+
+  $("#start-lock-btn")?.addEventListener("click", () => {
+    closeStartMenu();
+    sessionManager?.lockSession();
+  });
+
+  $("#start-sleep-btn")?.addEventListener("click", () => {
+    closeStartMenu();
+    sessionManager?.enterSleepMode();
+  });
+
+  $("#start-signout-btn")?.addEventListener("click", () => {
+    closeStartMenu();
+    sessionManager?.lockToLoginScreen();
+  });
+
+  $("#start-sleep-btn")?.addEventListener("click", () => {
+    closeStartMenu();
+    sessionManager?.sleep?.();
+  });
+
+  $("#start-restart-btn")?.addEventListener("click", () => {
+    closeStartMenu();
+    sessionManager?.restart?.();
+  });
+
+  $("#start-shutdown-btn")?.addEventListener("click", () => {
+    closeStartMenu();
+    location.reload();
+  });
+
+  $$(".start-cat").forEach((cat) => {
+    if (cat.classList.contains("docked") || !cat.dataset.cat) {
+      return;
+    }
+
+    cat.onclick = () => {
+      const catName = cat.dataset.cat;
+      if (catName === "settingsApp") {
+        os.app.launch("settingsApp");
+        return;
+      }
+      activateCategoryPage(cat);
+      if (catName === "favorites") {
+        speak("These are your favorites! Great taste.", ClippyAnimation.Show);
+      }
+      if (focusMode === "apps") {
+        const page = $(`.start-page[data-page="${catName}"]`);
+        if (page) selectFirstItemInPage(page);
+      }
+    };
+
+    cat.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      showCategoryContextMenu(e, cat);
+    });
+  });
+
+  const catListEl = $(".start-cat-list");
+  if (catListEl) {
+    catListEl.addEventListener("contextmenu", (e) => {
+      if (e.target.closest(".start-cat")) return;
+      const deletedCats = getCategoryDeleted();
+      if (deletedCats.size === 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      showDynamicContextMenu(e, (menu, item, hr) => {
+        menu.appendChild(
+          item(
+            "Restore All Categories",
+            () => {
+              deletedCats.forEach((c) => setCategoryDeleted(c, false));
+              applyStartMenuSettings(getStartMenuEl());
+            },
+            "papirus:actions/edit-undo"
+          )
+        );
+        if (deletedCats.size > 1) menu.appendChild(hr());
+        deletedCats.forEach((catName) => {
+          const label = catName.charAt(0).toUpperCase() + catName.slice(1);
+          menu.appendChild(
+            item(
+              `Restore "${label}"`,
+              () => {
+                setCategoryDeleted(catName, false);
+                applyStartMenuSettings(getStartMenuEl());
+              },
+              "papirus:actions/list-add"
+            )
+          );
+        });
+      });
+    });
+  }
+
+  const searchInput = $("#start-menu-search");
+
+  searchInput.addEventListener("focus", () => {
+    focusMode = "search";
+    clearSelection();
+    speak("Looking for an app? I know where everything is.", ClippyAnimation.Searching);
+  });
+
+  if (!keyboardHandlerInstalled) {
+    document.addEventListener("keydown", (e) => {
+      if (!isStartMenuOpen()) return;
+
+      if (KeybindManager.matches(e, "startMenu.arrowDown")) {
+        e.preventDefault();
+        if (focusMode === "search") {
+          $("#start-menu-search")?.blur();
+          focusMode = "categories";
+          navigateCategories("down");
+        } else if (focusMode === "categories") {
+          navigateCategories("down");
+        } else {
+          navigateSelection("down");
+        }
+      } else if (KeybindManager.matches(e, "startMenu.arrowUp")) {
+        e.preventDefault();
+        if (focusMode === "search") {
+          $("#start-menu-search")?.blur();
+          focusMode = "apps";
+          navigateSelection("up");
+        } else if (focusMode === "categories") {
+          navigateCategories("up");
+        } else {
+          navigateSelection("up");
+        }
+      } else if (KeybindManager.matches(e, "startMenu.arrowLeft")) {
+        e.preventDefault();
+        if (focusMode === "search") {
+          $("#start-menu-search")?.blur();
+        }
+        switchFocusMode("categories");
+      } else if (KeybindManager.matches(e, "startMenu.arrowRight")) {
+        e.preventDefault();
+        if (focusMode === "search") {
+          $("#start-menu-search")?.blur();
+        }
+        switchFocusMode("apps");
+      } else if (KeybindManager.matches(e, "startMenu.enter")) {
+        e.preventDefault();
+        if (focusMode === "search") {
+          const result = $(".start-page.active .start-menu-item:not(.letter-category-header)");
+          if (result) result.click();
+        } else if (focusMode === "categories" && selectedCategory) {
+          selectedCategory.dispatchEvent(new Event("click"));
+        } else {
+          launchSelectedItem();
+        }
+      }
+    });
+    keyboardHandlerInstalled = true;
+  }
+  function fuzzyMatch(query, target) {
+    const q = query.toLowerCase().trim();
+    const t = target.toLowerCase().trim();
+
+    if (!q) return true;
+    if (t.includes(q)) return true;
+
+    const qWords = q.split(/\s+/);
+    const tWords = t.split(/\s+/);
+
+    for (let i = 0; i < qWords.length; i++) {
+      const qw = qWords[i];
+
+      let matched = false;
+
+      for (let j = 0; j < tWords.length; j++) {
+        const tw = tWords[j];
+
+        if (tw === qw || tw.startsWith(qw)) {
+          matched = true;
+          break;
+        }
+
+        if (isCloseMatch(qw, tw)) {
+          matched = true;
+          break;
+        }
+      }
+
+      if (!matched) return false;
+    }
+
+    return true;
+  }
+
+  function isCloseMatch(a, b) {
+    if (a.length < 3) return false;
+
+    const dist = levenshtein(a, b);
+
+    return dist <= 1;
+  }
+
+  function wordBoundaryMatch(query, text) {
+    const q = query.toLowerCase().trim();
+    const t = text.toLowerCase().trim();
+    if (!q) return true;
+    if (!t) return false;
+    const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp("\\b" + escaped + "\\b").test(t);
+  }
+
+  function levenshtein(a, b) {
+    const dp = Array.from({ length: a.length + 1 }, () => new Array(b.length + 1).fill(0));
+
+    for (let i = 0; i <= a.length; i++) dp[i][0] = i;
+    for (let j = 0; j <= b.length; j++) dp[0][j] = j;
+
+    for (let i = 1; i <= a.length; i++) {
+      for (let j = 1; j <= b.length; j++) {
+        const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+
+        dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
+      }
+    }
+
+    return dp[a.length][b.length];
+  }
+  searchInput.addEventListener("input", (e) => {
+    clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = setTimeout(async () => {
+      const q = e.target.value.toLowerCase().trim();
+      const searchResultsPage = $('.start-page[data-page="search-results"]');
+
+      if (!searchResultsPage) {
+        const resultsPage = createElement("div");
+        resultsPage.className = "start-page";
+        resultsPage.dataset.page = "search-results";
+        resultsPage.innerHTML = '<div class="search-results-container"></div>';
+        $(".start-content").appendChild(resultsPage);
+      }
+
+      if (q === "") {
+        $(".start-menu")?.classList.remove("search-mode");
+        $$(".start-page").forEach((page) => {
+          if (page.dataset.page === "search-results") {
+            page.classList.remove("active");
+            setStyle(page, { display: "none" });
+          } else {
+            setStyle(page, { display: "" });
+            $$(".start-menu-item").forEach((item) => {
+              setStyle(item, { display: "" });
+            });
+          }
+        });
+
+        const activeCat = $(".start-cat.active");
+        if (activeCat) {
+          const page = $(`.start-page[data-page="${activeCat.dataset.cat}"]`);
+          if (page) page.classList.add("active");
+        }
+        return;
+      }
+
+      $(".start-menu")?.classList.add("search-mode");
+      $$(".start-page").forEach((page) => {
+        page.classList.remove("active");
+        setStyle(page, { display: "none" });
+      });
+
+      const resultsPage = $('.start-page[data-page="search-results"]');
+      setStyle(resultsPage, { display: "flex" });
+      resultsPage.classList.add("active");
+      const resultsContainer = $(".search-results-container", resultsPage);
+      resultsContainer.innerHTML = "";
+
+      const results = { core: [], web: [], games: [], files: [] };
+      const seenAppIds = new Set();
+
+      getSearchIndex().forEach(({ appId, appData, titleLower, descLower, isWeb, isGame }) => {
+        if (seenAppIds.has(appId)) return;
+        if (!fuzzyMatch(q, titleLower) && !wordBoundaryMatch(q, descLower)) return;
+        seenAppIds.add(appId);
+        const item = createAppItem(appId, appData);
+        const bucket = isWeb ? "web" : isGame ? "games" : "core";
+        results[bucket].push({ element: item, title: appData.title || appId });
+      });
+
+      SETTINGS_CATEGORIES.forEach((cat) => {
+        const title = `Settings: ${cat.title}`;
+        if (fuzzyMatch(q, title.toLowerCase())) {
+          const appId = `settings-${cat.id}`;
+          if (!seenAppIds.has(appId)) {
+            seenAppIds.add(appId);
+            const appData = { title, icon: cat.icon, type: "system", category: "system" };
+            results.core.push({ element: createAppItem(appId, appData), title });
+          }
+        }
+      });
+
+      const recentFiles = os.storage.get(StorageKeys.recentFiles) || [];
+      let fileResults = recentFiles.filter((f) => {
+        return fuzzyMatch(q, f.name) || fuzzyMatch(q, f.path);
+      });
+
+      const unmatched = recentFiles.filter(
+        (f) => isTextFile(f.name) && !fileResults.some((r) => r.name === f.name && r.path === f.path)
+      );
+      const contentMatches = await Promise.all(
+        unmatched.map(async (f) => {
+          const cacheKey = f.path + "/" + f.name;
+          let data = fileContentCache.get(cacheKey);
+          if (data === undefined) {
+            try {
+              const parts = f.path.split("/").filter(Boolean);
+              data = await os.fs.read([...parts, f.name]);
+              fileContentCache.set(cacheKey, data);
+            } catch {
+              fileContentCache.set(cacheKey, null);
+              return null;
+            }
+          }
+          if (data == null) return null;
+          const text = typeof data === "string" ? data : data?.toString?.() || "";
+          if (text.toLowerCase().includes(q)) {
+            return { ...f, contentMatch: true };
+          }
+          return null;
+        })
+      );
+      fileResults.push(...contentMatches.filter(Boolean));
+
+      const categoryOrder = ["core", "web", "games", "files"];
+      const categoryLabels = { core: "Core Apps", web: "Web Apps", games: "Games", files: "Files" };
+
+      const fragment = document.createDocumentFragment();
+      let hasResults = false;
+      categoryOrder.forEach((cat) => {
+        if (cat === "files") {
+          if (fileResults.length > 0) {
+            hasResults = true;
+            const categoryHeader = createElement("div");
+            categoryHeader.className = "search-category-header";
+            categoryHeader.textContent = categoryLabels.files;
+            fragment.appendChild(categoryHeader);
+
+            const categoryResults = createElement("div");
+            categoryResults.className = "search-category-results";
+            fileResults.forEach((f) => {
+              const item = createRecentFileItem(f.name, f.path, f.kind);
+              if (f.contentMatch) {
+                const badge = createElement("span");
+                badge.className = "search-content-badge";
+                badge.textContent = "content match";
+                item.appendChild(badge);
+              }
+              categoryResults.appendChild(item);
+            });
+            fragment.appendChild(categoryResults);
+          }
+          return;
+        }
+        if (results[cat].length > 0) {
+          hasResults = true;
+          const categoryHeader = createElement("div");
+          categoryHeader.className = "search-category-header";
+          categoryHeader.textContent = categoryLabels[cat];
+          fragment.appendChild(categoryHeader);
+
+          const categoryResults = createElement("div");
+          categoryResults.className = "search-category-results";
+          results[cat].forEach((result) => {
+            result.element.style.display = "";
+            categoryResults.appendChild(result.element);
+          });
+          fragment.appendChild(categoryResults);
+        }
+      });
+
+      if (!hasResults) {
+        const noResults = createElement("div");
+        noResults.className = "search-no-results";
+        noResults.textContent = "No results found";
+        fragment.appendChild(noResults);
+      }
+      resultsContainer.appendChild(fragment);
+    }, 120);
+  });
+
+  setupStartUserHover();
+}
+
+export function getCurrentUser() {
+  const userHistory = os.storage.get(StorageKeys.userHistory) || [];
+  const currentUserId = os.storage.get(StorageKeys.userId);
+
+  if (userHistory.length > 0 && currentUserId) {
+    const currentUser = userHistory.find((u) => u.userId === currentUserId);
+    if (currentUser) {
+      return {
+        name: currentUser.name,
+        avatar: currentUser.avatar
+      };
+    }
+  }
+
+  const fallbackName = os.storage.get(StorageKeys.username) || "Guest";
+  const fallbackAvatar = os.storage.get(StorageKeys.profilePicture) || "static/icons/guest.webp";
+
+  return {
+    name: fallbackName,
+    avatar: fallbackAvatar
+  };
+}
+
+export async function updateStartUserDisplay() {
+  const startUser = $(".start-user");
+  if (!startUser) return;
+
+  const user = getCurrentUser();
+
+  const nameSpan = $("span", startUser);
+  const avatarImg = $("img", startUser);
+
+  if (nameSpan) nameSpan.textContent = user.name;
+  if (avatarImg) avatarImg.src = await resolveAvatarUrl(user.avatar, "static/icons/guest.webp");
+}
+
+function setupStartUserHover() {
+  const startUser = $(".start-user");
+  if (!startUser) return;
+
+  let tooltip = null;
+
+  startUser.addEventListener("mouseenter", () => {
+    const user = getCurrentUser();
+
+    tooltip = createElement("div");
+    tooltip.className = "user-tooltip";
+    tooltip.textContent = user.name;
+    document.body.appendChild(tooltip);
+
+    const rect = startUser.getBoundingClientRect();
+    tooltip.style.left = `${rect.right + 10}px`;
+    tooltip.style.top = `${rect.top + rect.height / 2}px`;
+  });
+
+  startUser.addEventListener("mouseleave", () => {
+    if (tooltip) {
+      tooltip.remove();
+      tooltip = null;
+    }
+  });
+
+  updateStartUserDisplay();
+
+  os.events.on(BusEvents.PROFILE_UPDATED, () => {
+    updateStartUserDisplay();
+  });
+
+  os.events.on(BusEvents.SESSION_INITIALIZED, () => {
+    updateStartUserDisplay();
+  });
+}
+
+export function tryGetIcon(id) {
+  id = camelize(id);
+
+  if (id === "explorerApp") {
+    return resolveIconUrl("static/icons/file.webp");
+  }
+  if (id === "appCreatorApp") {
+    return "papirus:apps/kjumpingcube";
+  }
+  if (id === "kiwiIRC") {
+    return resolveIconUrl("static/icons/kiwiirc.webp");
+  }
+  if (id === "youtube") {
+    return "papirus:apps/youtube";
+  }
+  try {
+    if (os.app.getAllApps()) {
+      if (os.app.getAllApps()[id] && os.app.getAllApps()[id].icon) {
+        return os.app.getAllApps()[id].icon;
+      }
+      const camel = camelize(id);
+      if (os.app.getAllApps()[camel] && os.app.getAllApps()[camel].icon) {
+        return os.app.getAllApps()[camel].icon;
+      }
+      const found = Object.entries(os.app.getAllApps()).find(
+        ([key]) =>
+          key === id ||
+          key.startsWith(id) ||
+          id.startsWith(key) ||
+          key === camel ||
+          key.startsWith(camel) ||
+          camel.startsWith(key)
+      );
+      if (found && found[1].icon) {
+        return found[1].icon;
+      }
+    }
+
+    if (appMap[id] && appMap[id].icon) {
+      return appMap[id].icon;
+    }
+
+    const foundEntry = Object.entries(appMap).find(([key]) => key === id || key.startsWith(id) || id.startsWith(key));
+
+    if (foundEntry && foundEntry[1].icon) {
+      return foundEntry[1].icon;
+    }
+
+    const div = $(`#desktop div[data-app="${id}"]`);
+    const imgEl = div && $("img", div);
+    const svgEl = div && $("svg", div);
+    const imgSrc = imgEl?.src || svgEl;
+    return imgSrc;
+  } catch (e) {
+    console.error("Error occurred while getting icon:", e);
+    return null;
+  }
+}
+
+function getGridItems() {
+  const saved = os.storage.get(StorageKeys.startMenuGridItems);
+  if (saved) {
+    try {
+      const migrated = saved.map((i) =>
+        i.app === "installedAppsApp"
+          ? { ...i, app: "systemAppsApp", title: "System Apps", icon: "papirus:apps/utilities-tweak-tool" }
+          : i
+      );
+      const seen = new Set();
+      const deduped = migrated.filter((i) => {
+        if (seen.has(i.app)) return false;
+        seen.add(i.app);
+        return true;
+      });
+      if (deduped.length !== saved.length) {
+        os.storage.set(StorageKeys.startMenuGridItems, deduped);
+        return deduped;
+      }
+      return deduped;
+    } catch (e) {
+      console.error(e);
+    }
+  }
+  return [
+    { app: "browserApp", title: "Yuki Browser", icon: "papirus:apps/internet-web-browser" },
+    { app: "explorerApp", title: "Files", icon: "papirus:places/folder-blue" },
+    { app: "settingsApp", title: "Settings", icon: "papirus:actions/configure" },
+    { app: "aiAssistantApp", title: "Yuki AI Assistant", icon: "papirus:apps/gnome-robots" },
+    { app: "notepadApp", title: "Notepad", icon: "papirus:actions/edit" },
+    { app: "calculatorApp", title: "Calculator", icon: "papirus:apps/accessories-calculator" },
+    { app: "shortcutsApp", title: "Shortcuts", icon: "papirus:devices/input-keyboard" },
+    { app: "yukiConvertApp", title: "Yuki Convert", icon: "papirus:actions/swap-panels" },
+    { app: "cameraApp", title: "Camera", icon: "papirus:apps/accessories-camera" },
+    { app: "officeApp", title: "Office", icon: "papirus:mimetypes/x-office-document" },
+    { app: "clipboardManagerApp", title: "Clipboard Manager", icon: "papirus:actions/edit-paste" },
+    { app: "weatherApp", title: "Weather", icon: "papirus:apps/weather" },
+    { app: "yukiOsGuideApp", title: "YukiOS Guide", icon: "papirus:apps/accessories-dictionary" },
+    { app: "steamApp", title: "Yuki Steam", icon: "papirus:apps/steam" },
+    { app: "paint", title: "Paint", icon: "papirus:apps/gpaint" },
+    { app: "newsApp", title: "What's New", icon: "papirus:apps/accessories-text-editor" },
+    { app: "shittifyApp", title: "Evil Spotify", icon: "papirus:apps/juk" },
+    { app: "appCreatorApp", title: "AppCreator", icon: "papirus:apps/kjumpingcube" },
+    { app: "systemAppsApp", title: "System Apps", icon: "papirus:apps/utilities-tweak-tool" },
+    { app: "taskManagerApp", title: "Task Manager", icon: "papirus:apps/utilities-system-monitor" },
+    { app: "terminal", title: "Terminal", icon: "papirus:apps/utilities-terminal" },
+    { app: "aboutApp", title: "About YukiOS", icon: "papirus:actions/help-about" },
+    { app: "achievementsApp", title: "Achievements", icon: "papirus:actions/games-achievements" }
+  ];
+}
+
+function saveGridItems(items) {
+  os.storage.set(StorageKeys.startMenuGridItems, items);
+}
+function showStartItemEditor(currentItem) {
+  return new Promise((resolve) => {
+    const t0 = performance.now();
+
+    const overlay = createElement("div");
+    overlay.className = "explorer-confirmation-overlay start-editor-overlay";
+    overlay.style.zIndex = "20002";
+
+    const apps = Object.entries(os.app.getAllApps())
+      .map(([id, data]) => ({
+        id,
+        title: data.title || id,
+        icon: data.icon || ""
+      }))
+      .sort((a, b) => a.title.localeCompare(b.title));
+
+    const selectOptions = apps
+      .map(
+        (app) =>
+          `<option value="${app.id}" ${
+            currentItem && currentItem.app === app.id ? "selected" : ""
+          }>${app.title} (${app.id})</option>`
+      )
+      .join("");
+
+    const isCdnOrUrl = (str) =>
+      typeof str === "string" && (str.startsWith("http") || str.includes("/") || str.includes("."));
+
+    const getCleanIcon = (appId, explicitIcon) => {
+      if (explicitIcon && !isCdnOrUrl(explicitIcon)) return explicitIcon;
+      const app = apps.find((a) => a.id === appId);
+      if (app && app.icon && !isCdnOrUrl(app.icon)) return app.icon;
+      return "papirus:actions/bookmark-new";
+    };
+
+    const dialogTitle = currentItem ? "Edit Start Menu Item" : "Add Start Menu Item";
+
+    const titleVal = currentItem ? currentItem.title : apps[0]?.title || "";
+
+    const iconVal = getCleanIcon(currentItem ? currentItem.app : apps[0]?.id, currentItem?.icon);
+
+    let uploadedIconDataUrl = null;
+
+    if (currentItem && currentItem.icon && isCdnOrUrl(currentItem.icon)) {
+      uploadedIconDataUrl = currentItem.icon;
+    }
+
+    overlay.innerHTML = `
+      <div class="start-editor-dialog">
+        <div class="fd-dialog-title">${dialogTitle}</div>
+
+        <!-- App select -->
+        <div class="start-editor-field">
+          <label class="start-editor-label">Select Application</label>
+
+          <select id="editor-app-select" class="start-editor-hidden-select">
+            ${selectOptions}
+          </select>
+
+          <div id="custom-app-select" class="start-editor-select-box">
+            <span id="custom-app-select-label">Select Application...</span>
+            <span class="start-editor-select-arrow">▼</span>
+          </div>
+
+          <div id="custom-app-dropdown-list" class="start-editor-dropdown">
+            <div class="start-editor-dropdown-search">
+              <input
+                id="custom-app-search"
+                type="text"
+                placeholder="Search application..."
+                class="start-editor-search-input"
+              />
+            </div>
+            <div id="custom-app-options-container"></div>
+          </div>
+        </div>
+
+        <!-- Title -->
+        <div class="start-editor-field">
+          <label class="start-editor-label">Display Title</label>
+          <input id="editor-title-input"
+                 class="fd-dialog-input start-editor-input"
+                 type="text"
+                 value="${titleVal}" />
+        </div>
+
+        <!-- Icon -->
+        <div class="start-editor-field">
+          <label class="start-editor-label">FontAwesome Icon Class</label>
+          <input id="editor-icon-input"
+                 class="fd-dialog-input start-editor-input"
+                 type="text"
+                 value="${iconVal}" />
+          <div id="editor-icon-error" class="start-editor-error">
+            Must start with 'fa' or 'papirus:' (e.g. 'papirus:actions/bookmark-new')
+          </div>
+        </div>
+
+        <!-- Upload -->
+        <div class="start-editor-field">
+          <label class="start-editor-label">
+            Or Upload Custom Image Icon
+          </label>
+
+          <div class="start-editor-upload-row">
+            <input id="editor-icon-file" type="file" accept="image/*" hidden />
+
+            <button id="editor-upload-btn" class="fd-btn start-editor-btn">
+              Choose Image...
+            </button>
+
+            <div id="editor-image-preview" class="start-editor-preview">
+              <span id="editor-preview-placeholder">None</span>
+            </div>
+
+            <button id="editor-clear-upload-btn"
+                    class="fd-btn start-editor-clear-btn">
+              Clear
+            </button>
+          </div>
+        </div>
+
+        <!-- Actions -->
+        <div class="fd-dialog-actions">
+          <button class="fd-btn fd-btn-cancel">Cancel</button>
+          <button class="fd-btn fd-btn-confirm start-editor-save-btn">
+            Save
+          </button>
+        </div>
+      </div>
+    `;
+
+    const selectEl = $("#editor-app-select", overlay);
+    const customSelect = $("#custom-app-select", overlay);
+    const customSelectLabel = $("#custom-app-select-label", overlay);
+    const dropdownList = $("#custom-app-dropdown-list", overlay);
+    const searchInput = $("#custom-app-search", overlay);
+    const optionsContainer = $("#custom-app-options-container", overlay);
+    const titleInput = $("#editor-title-input", overlay);
+    const iconInput = $("#editor-icon-input", overlay);
+    const confirmBtn = $(".fd-btn-confirm", overlay);
+    const cancelBtn = $(".fd-btn-cancel", overlay);
+    const uploadBtn = $("#editor-upload-btn", overlay);
+    const fileInput = $("#editor-icon-file", overlay);
+    const imagePreview = $("#editor-image-preview", overlay);
+    const clearBtn = $("#editor-clear-upload-btn", overlay);
+
+    const optionItems = apps.map((app) => {
+      const opt = createElement("div");
+      opt.className = "start-editor-option";
+
+      opt.innerHTML = `
+        <div class="start-editor-option-title">
+          ${app.title}
+          <span class="start-editor-option-id">(${app.id})</span>
+        </div>
+      `;
+
+      opt.addEventListener("click", (e) => {
+        e.stopPropagation();
+        selectEl.value = app.id;
+        dropdownList.style.display = "none";
+        selectEl.dispatchEvent(new Event("change"));
+      });
+
+      optionsContainer.appendChild(opt);
+
+      return {
+        element: opt,
+        id: app.id,
+        title: app.title.toLowerCase(),
+        idLower: app.id.toLowerCase()
+      };
+    });
+
+    document.body.appendChild(overlay);
+
+    const close = () => {
+      overlay.remove();
+      resolve(null);
+    };
+
+    confirmBtn.onclick = () => {
+      const app = selectEl.value;
+      const title = titleInput.value.trim();
+      const icon = uploadedIconDataUrl || iconInput.value.trim();
+
+      if (!app || !title) return;
+      if (!uploadedIconDataUrl && !icon.startsWith("fa") && !icon.startsWith("papirus:")) return;
+
+      overlay.remove();
+      resolve({ app, title, icon });
+    };
+
+    cancelBtn.onclick = close;
+
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) close();
+    });
+
+    overlay.onkeydown = (ev) => {
+      if (KeybindManager.matches(ev, "session.cancel")) close();
+      if (KeybindManager.matches(ev, "startMenu.enter")) confirmBtn.click();
+    };
+  });
+}
+
+function addGridItem() {
+  showStartItemEditor().then((result) => {
+    if (result) {
+      const items = getGridItems();
+      items.push(result);
+      saveGridItems(items);
+      initializeAppGrid();
+    }
+  });
+}
+
+function editGridItem(itemData, index) {
+  showStartItemEditor(itemData).then((result) => {
+    if (result) {
+      const items = getGridItems();
+      items[index] = result;
+      saveGridItems(items);
+      initializeAppGrid();
+    }
+  });
+}
+
+function removeGridItem(index) {
+  const items = getGridItems();
+  items.splice(index, 1);
+  saveGridItems(items);
+  initializeAppGrid();
+}
+
+function showStartMenuContext(e, itemData, index) {
+  showDynamicContextMenu(e, (menu, item, hr) => {
+    menu.appendChild(
+      item(
+        "Edit Item",
+        () => {
+          editGridItem(itemData, index);
+        },
+        "papirus:actions/edit"
+      )
+    );
+    menu.appendChild(
+      item(
+        "Customize Icon & Title",
+        () => {
+          import("../shared/appCustomizer.js").then((m) =>
+            m.showAppCustomizer(itemData.app, itemData.title, itemData.icon)
+          );
+        },
+        "papirus:apps/com.github.cassidyjames.palette"
+      )
+    );
+    menu.appendChild(
+      item(
+        "Remove Item",
+        () => {
+          removeGridItem(index);
+        },
+        "papirus:actions/entry-delete"
+      )
+    );
+    menu.appendChild(hr());
+    menu.appendChild(
+      item(
+        "Add New Item",
+        () => {
+          addGridItem();
+        },
+        "papirus:actions/list-add"
+      )
+    );
+  });
+}
+
+function showStartGridContext(e) {
+  showDynamicContextMenu(e, (menu, item, hr) => {
+    menu.appendChild(
+      item(
+        "Add New Item",
+        () => {
+          addGridItem();
+        },
+        "papirus:actions/list-add"
+      )
+    );
+  });
+}
+
+export function initializeAppGrid() {
+  const grid = $(".app-grid");
+  if (!grid) return;
+  grid.innerHTML = "";
+
+  const items = getGridItems();
+  const appRegistry = getAppRegistry();
+  const fragment = document.createDocumentFragment();
+  items.forEach((itemData, index) => {
+    if (appRegistry.isAppUninstalled(itemData.app) || appRegistry.isAppDisabled(itemData.app)) return;
+    const item = createElement("div");
+    item.className = "start-menu-item";
+    item.dataset.app = itemData.app;
+    item.dataset.index = index;
+
+    const iconVal = itemData.icon || "papirus:actions/bookmark-new";
+    item.appendChild(buildIconEl(iconVal));
+
+    const contentEl = createElement("div");
+    contentEl.className = "app-content";
+    item.appendChild(contentEl);
+
+    const titleEl = createElement("span");
+    titleEl.className = "app-title";
+    titleEl.textContent = itemData.title;
+    contentEl.appendChild(titleEl);
+
+    const descEl = createElement("span");
+    descEl.className = "app-description";
+    const description = APP_DESCRIPTIONS[itemData.app] || descriptionMap[itemData.app] || "";
+    descEl.textContent = description;
+    descEl.dataset.fullDescription = description;
+    contentEl.appendChild(descEl);
+
+    if (itemData.app === "newsApp") {
+      const badge = createElement("span");
+      badge.className = "news-badge";
+      badge.style.display = "none";
+      item.appendChild(badge);
+    }
+
+    item.addEventListener("click", () => {
+      trackRecentlyUsed(itemData.app);
+      os.app.launch(itemData.app);
+      closeStartMenu();
+    });
+
+    item.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      showStartMenuContext(e, itemData, index);
+    });
+
+    fragment.appendChild(item);
+  });
+
+  grid.appendChild(fragment);
+
+  if (items.length === 0) {
+    const placeholder = createElement("div");
+    placeholder.className = "start-menu-item";
+    placeholder.style.opacity = "0";
+    placeholder.style.transition = "opacity 0.2s";
+    placeholder.style.cursor = "pointer";
+    const placeholderEffective = getEffectiveIcon("papirus:actions/list-add");
+    if (typeof placeholderEffective === "string" && placeholderEffective.startsWith("papirus:")) {
+      const iconEl = createElement("img");
+      iconEl.src = resolveIconUrl(placeholderEffective);
+      iconEl.className = "papirus-icon papirus-icon--16";
+      iconEl.alt = "";
+      placeholder.appendChild(iconEl);
+    } else if (typeof placeholderEffective === "string" && placeholderEffective.startsWith("fa")) {
+      const iconEl = createElement("i");
+      iconEl.className = placeholderEffective;
+      placeholder.appendChild(iconEl);
+    } else {
+      const iconEl = createElement("img");
+      iconEl.src = resolveIconUrl(placeholderEffective);
+      iconEl.className = "papirus-icon papirus-icon--16";
+      iconEl.alt = "";
+      placeholder.appendChild(iconEl);
+    }
+
+    const spanEl = createElement("span");
+    spanEl.textContent = "Add Item";
+    placeholder.appendChild(spanEl);
+
+    placeholder.addEventListener("click", () => addGridItem());
+
+    grid.appendChild(placeholder);
+
+    grid.onmouseenter = () => {
+      placeholder.style.opacity = "1";
+    };
+    grid.onmouseleave = () => {
+      placeholder.style.opacity = "0";
+    };
+  } else {
+    grid.onmouseenter = null;
+    grid.onmouseleave = null;
+  }
+
+  grid.addEventListener("contextmenu", (e) => {
+    if (e.target === grid || items.length === 0) {
+      e.preventDefault();
+      e.stopPropagation();
+      showStartGridContext(e);
+    }
+  });
+
+  refreshIcons(grid);
+}
+
+const LETTER_SEPARATOR = "";
+
+function populateCategoryPage(category) {
+  const page = $(`.start-page[data-page="${category}"]`);
+  if (!page) return;
+
+  const grid = $(".app-grid", page);
+  if (!grid) return;
+  grid.innerHTML = "";
+
+  const appRegistry = getAppRegistry();
+  const allApps = getAllAppsMerged();
+
+  const apps = [];
+  Object.entries(allApps).forEach(([appId, appData]) => {
+    if (appRegistry.isAppUninstalled(appId) || appRegistry.isAppDisabled(appId)) return;
+
+    let shouldInclude = false;
+    if (category === CORE_MENU_CATEGORY) {
+      shouldInclude = isCoreApp(appId, appData);
+    } else if (category === WEB_MENU_CATEGORY) {
+      shouldInclude = isWebApp(appId, appData);
+    } else if (category === "games") {
+      shouldInclude = appData.type === "game";
+    } else if (category === "system") {
+      const appCategory = getAppCategory(appId, appData);
+      shouldInclude = appData.type === "system" && appCategory === "system";
+    } else {
+      const appCategory = getAppCategory(appId, appData);
+      shouldInclude = appCategory === category;
+    }
+
+    if (shouldInclude) {
+      apps.push({ appId, appData });
+    }
+  });
+
+  if (category === CORE_MENU_CATEGORY || category === "system") {
+    SETTINGS_CATEGORIES.forEach((cat) => {
+      const appId = `settings-${cat.id}`;
+      const appData = { title: `Settings: ${cat.title}`, icon: cat.icon, type: "system", category: "system" };
+      apps.push({ appId, appData });
+    });
+  }
+
+  const fragment = document.createDocumentFragment();
+
+  if (category === CORE_MENU_CATEGORY) {
+    apps.sort((a, b) => (a.appData.title || a.appId).localeCompare(b.appData.title || b.appId));
+
+    const groupedApps = {};
+    apps.forEach(({ appId, appData }) => {
+      const title = appData.title || appId;
+      const firstLetter = title.charAt(0).toUpperCase();
+      if (!groupedApps[firstLetter]) {
+        groupedApps[firstLetter] = [];
+      }
+      groupedApps[firstLetter].push({ appId, appData });
+    });
+
+    Object.keys(groupedApps)
+      .sort()
+      .forEach((letter) => {
+        const letterHeader = createElement("div");
+        letterHeader.className = "letter-category-header";
+        letterHeader.innerHTML = `<span class="letter-title">${letter}</span><span class="letter-separator">${LETTER_SEPARATOR}</span>`;
+        fragment.appendChild(letterHeader);
+
+        groupedApps[letter].forEach(({ appId, appData }) => {
+          fragment.appendChild(createAppItem(appId, appData));
+        });
+      });
+  } else if (category === WEB_MENU_CATEGORY) {
+    WEB_CATEGORY_ORDER.forEach((webCategory) => {
+      const categoryApps = apps.filter(({ appId, appData }) => getAppCategory(appId, appData) === webCategory);
+      if (categoryApps.length === 0) return;
+
+      const categoryHeader = createElement("div");
+      categoryHeader.className = "search-category-header";
+      categoryHeader.textContent = WEB_CATEGORY_LABELS[webCategory] || webCategory;
+      fragment.appendChild(categoryHeader);
+
+      const categoryResults = createElement("div");
+      categoryResults.className = "search-category-results";
+      categoryApps
+        .sort((a, b) => (a.appData.title || a.appId).localeCompare(b.appData.title || b.appId))
+        .forEach(({ appId, appData }) => {
+          categoryResults.appendChild(createAppItem(appId, appData));
+        });
+      fragment.appendChild(categoryResults);
+    });
+  } else {
+    apps.forEach(({ appId, appData }) => {
+      fragment.appendChild(createAppItem(appId, appData));
+    });
+  }
+
+  grid.appendChild(fragment);
+}
+
+function toggleStartPin(appId) {
+  if (getFavorites().includes(appId)) unfavoriteApp(appId);
+  else favoriteApp(appId);
+}
+
+function showAppItemContextMenu(e, appId, appData) {
+  showDynamicContextMenu(e, (menu, item, hr) => {
+    const isPinned = isAppPinnedToTaskbar(appId);
+    menu.appendChild(
+      item(
+        isPinned ? "Unpin from Taskbar" : "Pin to Taskbar",
+        () => toggleTaskbarPin(appId, appData),
+        isPinned ? "papirus:actions/window-pin" : "papirus:actions/window-pin"
+      )
+    );
+
+    const isFavorite = getFavorites().includes(appId);
+    menu.appendChild(
+      item(
+        isFavorite ? "Unpin from Start" : "Pin to Start",
+        () => toggleStartPin(appId),
+        isFavorite ? "papirus:actions/bookmark-new" : "papirus:actions/bookmark-new"
+      )
+    );
+
+    menu.appendChild(
+      item(
+        "Add to Desktop",
+        async () => {
+          try {
+            const already = await isAppOnDesktop(appId);
+            if (already) {
+              os.notify.send("Already on Desktop", `${appData.title || appId} is already on your desktop.`);
+              return;
+            }
+            await addAppToDesktop(appId, appData);
+            os.notify.send("Added to Desktop", `${appData.title || appId} is now on your desktop.`);
+          } catch (error) {
+            os.notify.send("Add to Desktop", "Could not add the app to your desktop.");
+          }
+        },
+        "papirus:devices/computer"
+      )
+    );
+
+    menu.appendChild(hr());
+
+    menu.appendChild(
+      item(
+        "View in Installed Apps",
+        () => os.app.launch("systemAppsApp", { searchQuery: appData.title || appId }),
+        "papirus:actions/view-grid"
+      )
+    );
+
+    menu.appendChild(item("Properties", () => showAppProperties(appId, appData), "papirus:actions/help-about"));
+
+    menu.appendChild(hr());
+
+    menu.appendChild(
+      item(
+        "Customize Icon & Title",
+        () => {
+          import("../shared/appCustomizer.js").then((m) =>
+            m.showAppCustomizer(appId, appData.title || appId, appData.icon || "")
+          );
+        },
+        "papirus:apps/com.github.cassidyjames.palette"
+      )
+    );
+
+    menu.appendChild(
+      item(
+        "Edit Item",
+        () => {
+          os.dialog
+            .prompt("Edit Item", `Enter a new name for "${appData.title || appId}":`, appData.title || appId)
+            .then((newName) => {
+              if (newName === null) return;
+              const appRegistry = getAppRegistry();
+              if (newName.trim() === "") {
+                appRegistry.resetAppName(appId);
+                appData.title = appRegistry.getAppDisplayName(appId, appData.title);
+              } else {
+                appRegistry.setAppName(appId, newName.trim());
+                appData.title = newName.trim();
+              }
+              const entryEl = $(`.start-menu-item[data-app="${CSS.escape(appId)}"] .app-title`);
+              if (entryEl) entryEl.textContent = appData.title;
+            });
+        },
+        "papirus:actions/edit"
+      )
+    );
+
+    menu.appendChild(hr());
+
+    menu.appendChild(
+      item(
+        "Uninstall",
+        async () => {
+          const confirmed = await os.dialog.confirm(
+            "Uninstall App",
+            `Are you sure you want to uninstall ${appData.title || appId}? You can restore it later.`
+          );
+          if (confirmed) {
+            const appRegistry = getAppRegistry();
+            if (appRegistry) {
+              appRegistry.uninstallApp(appId);
+            }
+          }
+        },
+        "papirus:actions/entry-delete"
+      )
+    );
+  });
+}
+
+function showCategoryContextMenu(e, catEl) {
+  const catName = catEl.dataset.cat;
+  const renames = getCategoryRenames();
+  const currentLabel = renames[catName] || catEl.textContent.trim();
+  const isProtected = PROTECTED_CATEGORIES.has(catName);
+
+  showDynamicContextMenu(e, (menu, item, hr) => {
+    menu.appendChild(
+      item(
+        "Rename Category",
+        () => {
+          os.dialog.prompt("Rename Category", `Enter a new name for this category:`, currentLabel).then((newLabel) => {
+            if (newLabel === null) return;
+            if (newLabel.trim() === "") {
+              setCategoryRename(catName, "");
+              const iconEl = catEl.querySelector("i");
+              const textNode = catEl.childNodes[catEl.childNodes.length - 1];
+              if (textNode) textNode.textContent = ` ${catName.charAt(0).toUpperCase() + catName.slice(1)}`;
+            } else {
+              setCategoryRename(catName, newLabel.trim());
+              const iconEl = catEl.querySelector("i");
+              const textNode = catEl.childNodes[catEl.childNodes.length - 1];
+              if (textNode) textNode.textContent = ` ${newLabel.trim()}`;
+            }
+          });
+        },
+        "papirus:actions/edit"
+      )
+    );
+    if (!isProtected) {
+      menu.appendChild(
+        item(
+          "Delete Category",
+          () => {
+            setCategoryDeleted(catName, true);
+            catEl.style.display = "none";
+          },
+          "papirus:actions/entry-delete"
+        )
+      );
+    }
+  });
+}
+
+function createAppItem(appId, appData) {
+  const item = createElement("div");
+  item.className = "start-menu-item";
+  item.dataset.app = appId;
+  item.style.position = "relative";
+
+  item.appendChild(buildIconEl(appData.icon || "papirus:actions/bookmark-new"));
+
+  const contentEl = createElement("div");
+  contentEl.className = "app-content";
+  item.appendChild(contentEl);
+
+  const titleEl = createElement("span");
+  titleEl.className = "app-title";
+  titleEl.textContent = appData.title || appId;
+  contentEl.appendChild(titleEl);
+
+  const descEl = createElement("span");
+  descEl.className = "app-description";
+  const description = APP_DESCRIPTIONS[appId] || descriptionMap[appId] || "";
+  descEl.textContent = description;
+  descEl.dataset.fullDescription = description;
+  contentEl.appendChild(descEl);
+
+  descEl.addEventListener("mouseenter", (e) => {
+    if (description.length > 50) {
+      const rect = descEl.getBoundingClientRect();
+      showDescriptionTooltip(description, rect.left, rect.bottom);
+    }
+  });
+  descEl.addEventListener("mouseleave", hideDescriptionTooltip);
+
+  const star = createStarButton(appId);
+  star.style.opacity = "0";
+  star.style.transition = "opacity 0.2s";
+  item.appendChild(star);
+
+  item.addEventListener("mouseenter", () => (star.style.opacity = "1"));
+  item.addEventListener("mouseleave", () => (star.style.opacity = "0"));
+
+  if (getFavorites().includes(appId)) {
+    item.style.background = "rgba(255, 215, 0, 0.1)";
+  }
+
+  item.addEventListener("click", () => {
+    if (appId.startsWith("settings-")) {
+      const key = appId.replace("settings-", "");
+      const cat = SETTINGS_CATEGORIES.find((c) => c.id === key);
+      launchSettingsPane(cat ? cat.pane : key);
+    } else {
+      trackRecentlyUsed(appId);
+      os.app.launch(appId);
+    }
+    closeStartMenu();
+  });
+
+  item.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    showAppItemContextMenu(e, appId, appData);
+  });
+
+  return item;
+}
